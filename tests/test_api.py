@@ -11,9 +11,6 @@ from app.ollama_client import (
 from app.settings import Settings
 
 
-API_KEY = "test-key"
-
-
 def override_settings() -> Settings:
     return Settings()
 
@@ -39,10 +36,6 @@ def sample_payload() -> dict:
     }
 
 
-def auth_headers() -> dict:
-    return {"X-API-Key": API_KEY}
-
-
 def test_process_claim_accepts_missing_api_key(client: TestClient):
     async def fake_analysis():
         return ClaimAnalysisResponse(
@@ -65,7 +58,7 @@ def test_process_claim_rejects_empty_claim(client: TestClient):
     payload = sample_payload()
     payload["claim"] = "   "
 
-    response = client.post("/process/claim", headers=auth_headers(), json=payload)
+    response = client.post("/process/claim", json=payload)
 
     assert response.status_code == 422
 
@@ -74,7 +67,7 @@ def test_process_claim_rejects_empty_source_id(client: TestClient):
     payload = sample_payload()
     payload["source_id"] = "   "
 
-    response = client.post("/process/claim", headers=auth_headers(), json=payload)
+    response = client.post("/process/claim", json=payload)
 
     assert response.status_code == 422
 
@@ -83,7 +76,7 @@ def test_process_claim_rejects_missing_excerpt(client: TestClient):
     payload = sample_payload()
     del payload["excerpt"]
 
-    response = client.post("/process/claim", headers=auth_headers(), json=payload)
+    response = client.post("/process/claim", json=payload)
 
     assert response.status_code == 422
 
@@ -92,7 +85,7 @@ def test_process_claim_rejects_oversized_excerpt(client: TestClient):
     payload = sample_payload()
     payload["excerpt"] = "x" * 4001
 
-    response = client.post("/process/claim", headers=auth_headers(), json=payload)
+    response = client.post("/process/claim", json=payload)
 
     assert response.status_code == 422
 
@@ -109,7 +102,7 @@ def test_process_claim_rejects_old_sources_shape(client: TestClient):
         ],
     }
 
-    response = client.post("/process/claim", headers=auth_headers(), json=payload)
+    response = client.post("/process/claim", json=payload)
 
     assert response.status_code == 422
 
@@ -126,7 +119,7 @@ def test_process_claim_returns_structured_model_result(client: TestClient):
 
     app.dependency_overrides[run_claim_analysis] = fake_analysis
 
-    response = client.post("/process/claim", headers=auth_headers(), json=sample_payload())
+    response = client.post("/process/claim", json=sample_payload())
 
     assert response.status_code == 200
     assert response.json() == {
@@ -144,7 +137,7 @@ def test_process_claim_returns_503_when_ollama_is_unavailable(client: TestClient
 
     app.dependency_overrides[run_claim_analysis] = fake_analysis
 
-    response = client.post("/process/claim", headers=auth_headers(), json=sample_payload())
+    response = client.post("/process/claim", json=sample_payload())
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Ollama generation failed"
@@ -156,7 +149,7 @@ def test_process_claim_returns_502_when_model_json_is_invalid(client: TestClient
 
     app.dependency_overrides[run_claim_analysis] = fake_analysis
 
-    response = client.post("/process/claim", headers=auth_headers(), json=sample_payload())
+    response = client.post("/process/claim", json=sample_payload())
 
     assert response.status_code == 502
     assert response.json()["detail"] == "Ollama returned invalid claim-analysis JSON"
@@ -200,6 +193,21 @@ def test_health_returns_ollama_status(client: TestClient):
     }
 
 
+def test_health_reports_degraded_when_dependency_is_unavailable():
+    import asyncio
+    from app.main import health
+
+    result = asyncio.run(
+        health(
+            Settings(),
+            {"ok": True, "model_available": True, "embedding_model_available": True},
+            {"ok": False, "package": "liteparse"},
+        )
+    )
+
+    assert result["status"] == "degraded"
+
+
 def test_ollama_health_checks_embedding_model_alias(monkeypatch):
     import asyncio
     from app.ollama_client import check_ollama
@@ -239,6 +247,24 @@ def test_ollama_health_checks_embedding_model_alias(monkeypatch):
         "model_available": True,
         "embedding_model_available": True,
     }
+
+
+def test_ollama_health_rejects_invalid_response(monkeypatch):
+    import asyncio
+    import httpx
+    from app.ollama_client import check_ollama
+
+    async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(200, json={"models": [{"size": 123}]})
+    )
+    monkeypatch.setattr(
+        "app.ollama_client.httpx.AsyncClient",
+        lambda timeout: async_client(timeout=timeout, transport=transport),
+    )
+
+    with pytest.raises(OllamaInvalidResponseError):
+        asyncio.run(check_ollama(Settings()))
 
 
 def test_liteparse_health_reports_package_availability(monkeypatch):
@@ -299,6 +325,23 @@ def test_demo_storage_routes_are_not_exposed(client: TestClient):
     assert post_papers.status_code == 404
     assert review_paper.status_code == 404
     assert process_document.status_code == 404
+
+
+def test_sparse_embed_returns_weighted_token_counts(client: TestClient, monkeypatch):
+    import math
+
+    class FakeTokenizer:
+        def __call__(self, text):
+            assert text == "repeat repeat once"
+            return {"input_ids": [101, 10, 10, 11, 102, 0]}
+
+    monkeypatch.setattr("app.sparse._get_tokenizer", lambda: FakeTokenizer())
+
+    response = client.post("/api/sparse-embed", json={"text": "repeat repeat once"})
+
+    assert response.status_code == 200
+    assert response.json()["indices"] == [10, 11]
+    assert response.json()["values"] == pytest.approx([math.log(3), math.log(2)])
 
 
 def test_extract_returns_json_error_when_liteparse_fails(
@@ -439,6 +482,42 @@ def test_analyze_claim_logs_ai_verdict_and_explanation(monkeypatch, caplog):
         "ai explanation The source directly links traceability to review quality." in message
         for message in messages
     )
+
+
+def test_analyze_claim_rejects_unknown_source_id(monkeypatch):
+    import asyncio
+    import httpx
+    import json
+
+    async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200,
+            json={
+                "response": json.dumps(
+                    {
+                        "verdict": "supported",
+                        "confidence": 0.9,
+                        "matched_source_ids": ["invented-source"],
+                        "missing_evidence": [],
+                        "explanation": "The source supports the claim.",
+                    }
+                )
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "app.ollama_client.httpx.AsyncClient",
+        lambda timeout: async_client(timeout=timeout, transport=transport),
+    )
+
+    with pytest.raises(OllamaInvalidResponseError):
+        asyncio.run(
+            analyze_claim(
+                ClaimAnalysisRequest.model_validate(sample_payload()),
+                Settings(),
+            )
+        )
 
 
 def test_get_embeddings_success(client: TestClient):

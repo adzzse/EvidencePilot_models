@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 
-from app.models import ClaimAnalysisRequest, ClaimAnalysisResponse, GenerateRequest, GenerateResponse, ModelsResponse
+from app.models import ClaimAnalysisRequest, ClaimAnalysisResponse, GenerateResponse, ModelsResponse
 from app.settings import Settings
 
 
@@ -54,8 +54,12 @@ async def check_ollama(settings: Settings) -> dict[str, Any]:
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
         raise OllamaUnavailableError("Ollama is not reachable") from exc
 
-    data = response.json()
-    model_names = {model.get("name") for model in data.get("models", [])}
+    try:
+        models = ModelsResponse.model_validate(response.json()).models
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise OllamaInvalidResponseError("Ollama returned invalid models response") from exc
+
+    model_names = {model.name for model in models}
     return {
         "ok": True,
         "model_available": _model_available(settings.ollama_model, model_names),
@@ -116,6 +120,8 @@ async def analyze_claim(payload: ClaimAnalysisRequest, settings: Settings) -> Cl
         if reasoning_summary:
             logger.debug("ai reasoning summary %s", reasoning_summary)
         result = ClaimAnalysisResponse.model_validate(model_json)
+        if any(source_id != payload.source_id for source_id in result.matched_source_ids):
+            raise ValueError("matched_source_ids contains an unknown source id")
         logger.info(
             "ai verdict verdict=%s confidence=%s matched_source_ids=%s missing_evidence=%s",
             result.verdict,
@@ -144,10 +150,6 @@ async def list_models(settings: Settings) -> ModelsResponse:
     except (TypeError, ValueError, ValidationError) as exc:
         logger.info("models response invalid reason=%s", exc)
         raise OllamaInvalidResponseError("Ollama returned invalid models response") from exc
-
-
-async def generate_response(payload: GenerateRequest, settings: Settings) -> GenerateResponse:
-    return await generate_text(payload.prompt, settings)
 
 
 async def generate_text(prompt: str, settings: Settings) -> GenerateResponse:

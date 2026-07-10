@@ -22,7 +22,7 @@ from app.ollama_client import (
     analyze_claim,
     check_ollama,
     generate_embeddings,
-    generate_response,
+    generate_text,
     list_models,
 )
 from app.settings import Settings, load_settings
@@ -60,8 +60,14 @@ async def health(
     ollama_status: dict = Depends(check_ollama_health),
     liteparse_status: dict = Depends(check_liteparse_health),
 ) -> dict:
+    healthy = (
+        ollama_status.get("ok") is True
+        and ollama_status.get("model_available") is True
+        and ollama_status.get("embedding_model_available") is True
+        and liteparse_status.get("ok") is True
+    )
     return {
-        "status": "ok",
+        "status": "ok" if healthy else "degraded",
         "model": settings.ollama_model,
         "embedding_model": settings.ollama_embedding_model,
         "ollama": ollama_status,
@@ -122,7 +128,7 @@ async def run_generate_text(
         len(payload.prompt),
         settings.ollama_model,
     )
-    result = GenerateResponse.model_validate(await generate_response(payload, settings))
+    result = await generate_text(payload.prompt, settings)
     logger.debug(
         "generate complete prompt_chars=%s response_chars=%s",
         len(payload.prompt),
@@ -169,6 +175,6 @@ async def ollama_invalid_response_handler(_, exc: OllamaInvalidResponseError):
 @app.exception_handler(ExtractionError)
 async def extraction_error_handler(_, exc: ExtractionError):
     raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=str(exc),
     )

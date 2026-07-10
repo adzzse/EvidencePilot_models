@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app, get_settings
+from app.models import GenerateResponse
 from app.ollama_client import OllamaUnavailableError
 from app.settings import Settings
 
@@ -21,16 +22,16 @@ def client() -> TestClient:
 def test_ai_generate_defaults_model_and_stream_false(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     captured = {}
 
-    async def fake_generate(payload, settings):
-        captured["payload"] = payload
+    async def fake_generate(prompt, settings):
+        captured["prompt"] = prompt
         captured["settings"] = settings
-        return {
-            "model": "evidencopilot:latest",
-            "response": "RAG combines retrieval with generation.",
-            "done": True,
-        }
+        return GenerateResponse(
+            model="evidencopilot:latest",
+            response="RAG combines retrieval with generation.",
+            done=True,
+        )
 
-    monkeypatch.setattr("app.main.generate_response", fake_generate)
+    monkeypatch.setattr("app.main.generate_text", fake_generate)
 
     response = client.post("/ai/generate", json={"prompt": "Explain RAG."})
 
@@ -40,7 +41,7 @@ def test_ai_generate_defaults_model_and_stream_false(client: TestClient, monkeyp
         "response": "RAG combines retrieval with generation.",
         "done": True,
     }
-    assert captured["payload"].prompt == "Explain RAG."
+    assert captured["prompt"] == "Explain RAG."
     assert captured["settings"].ollama_model == "evidencopilot:latest"
 
 
@@ -98,10 +99,10 @@ def test_ai_models_returns_ollama_models(client: TestClient, monkeypatch: pytest
 
 
 def test_ai_generate_returns_503_when_ollama_is_unavailable(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    async def fake_generate(payload, settings):
+    async def fake_generate(prompt, settings):
         raise OllamaUnavailableError("Ollama generation failed")
 
-    monkeypatch.setattr("app.main.generate_response", fake_generate)
+    monkeypatch.setattr("app.main.generate_text", fake_generate)
 
     response = client.post("/ai/generate", json={"prompt": "Explain RAG."})
 

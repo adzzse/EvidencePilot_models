@@ -13,10 +13,10 @@ The Java backend calls this service with `AI_MODEL_BASE_URL`, for example `AI_MO
 ## Setup
 
 ```powershell
-cd E:\Code\SEP490\ollama-claim-api
+cd E:\Code\SEP490\EvidencePilot_models
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 Copy-Item .env.example .env
 ```
 
@@ -29,7 +29,7 @@ ollama create evidencopilot -f Modelfile
 ## Run
 
 ```powershell
-cd E:\Code\SEP490\ollama-claim-api
+cd E:\Code\SEP490\EvidencePilot_models
 .\.venv\Scripts\Activate.ps1
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -149,7 +149,7 @@ Response:
 Start the local API and expose it through ngrok:
 
 ```powershell
-cd E:\Code\SEP490\ollama-claim-api
+cd E:\Code\SEP490\EvidencePilot_models
 .\.venv\Scripts\Activate.ps1
 python scripts\start_ngrok_tunnel.py
 ```
@@ -163,6 +163,6 @@ python scripts\start_ngrok_tunnel.py --no-server
 ## Tests
 
 ```powershell
-cd E:\Code\SEP490\ollama-claim-api
+cd E:\Code\SEP490\EvidencePilot_models
 .\.venv\Scripts\python.exe -m pytest -q
 ```
