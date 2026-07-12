@@ -1,43 +1,88 @@
 import logging
-import os
+from typing import Any
 
 import httpx
+
+from app.models import GenerateResponse
+from app.settings import Settings
+
 
 logger = logging.getLogger(__name__)
 
 
-async def generate_embeddings(text: str) -> list[float]:
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    model = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+class OllamaUnavailableError(RuntimeError):
+    pass
 
-    request_body = {
-        "model": model,
-        "prompt": text,
-    }
-    logger.info("embeddings request start model=%s text_chars=%s", model, len(text))
 
+class OllamaInvalidResponseError(RuntimeError):
+    pass
+
+
+async def check_ollama(settings: Settings) -> dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{base_url}/api/embeddings",
-                json=request_body,
-            )
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{settings.ollama_base_url}/api/tags")
             response.raise_for_status()
+        models = response.json().get("models", [])
+        names = {model.get("name", "") for model in models if isinstance(model, dict)}
+        if not names:
+            raise ValueError("missing models")
     except httpx.HTTPError as exc:
-        logger.info("embeddings request failed model=%s reason=%s", model, exc)
-        raise RuntimeError("Ollama embeddings generation failed") from exc
+        raise OllamaUnavailableError("Ollama is not reachable") from exc
+    except (TypeError, ValueError) as exc:
+        raise OllamaInvalidResponseError("Ollama returned an invalid models response") from exc
 
+    model_available = _available(settings.ollama_model, names)
+    embedding_model_available = _available(settings.ollama_embedding_model, names)
+    return {
+        "ok": model_available and embedding_model_available,
+        "model_available": model_available,
+        "embedding_model_available": embedding_model_available,
+    }
+
+
+async def generate_text(prompt: str, settings: Settings) -> GenerateResponse:
+    payload = {
+        "model": settings.ollama_model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+    }
     try:
-        response_data = response.json()
-        embedding = response_data.get("embedding")
-        if embedding is None:
-            embeddings = response_data.get("embeddings")
-            if embeddings and isinstance(embeddings, list):
-                embedding = embeddings[0]
-        if not isinstance(embedding, list) or not embedding:
-            raise ValueError("No embedding vector found in response")
-        logger.info("embeddings request complete dimensions=%s", len(embedding))
-        return embedding
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(f"{settings.ollama_base_url}/api/generate", json=payload)
+            response.raise_for_status()
+        data = response.json()
+        return GenerateResponse(
+            model=data["model"],
+            response=data["response"],
+            done=data["done"],
+        )
+    except httpx.HTTPError as exc:
+        raise OllamaUnavailableError("Ollama generation failed") from exc
     except (KeyError, TypeError, ValueError) as exc:
-        logger.info("embeddings response invalid reason=%s", exc)
-        raise RuntimeError("Ollama returned invalid embeddings response") from exc
+        raise OllamaInvalidResponseError("Ollama returned an invalid generation response") from exc
+
+
+async def generate_embeddings(texts: list[str], settings: Settings) -> list[list[float]]:
+    payload = {"model": settings.ollama_embedding_model, "input": texts}
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(f"{settings.ollama_base_url}/api/embed", json=payload)
+            response.raise_for_status()
+        embeddings = response.json().get("embeddings")
+        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+            raise ValueError("embedding count mismatch")
+        if any(not isinstance(vector, list) or not vector for vector in embeddings):
+            raise ValueError("empty embedding")
+        return [[float(value) for value in vector] for vector in embeddings]
+    except httpx.HTTPError as exc:
+        raise OllamaUnavailableError("Ollama embeddings generation failed") from exc
+    except (TypeError, ValueError) as exc:
+        raise OllamaInvalidResponseError("Ollama returned invalid embeddings") from exc
+
+
+def _available(configured: str, names: set[str]) -> bool:
+    return configured in names or f"{configured}:latest" in names or any(
+        name.split(":", 1)[0] == configured for name in names
+    )
