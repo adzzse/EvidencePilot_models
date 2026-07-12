@@ -12,6 +12,7 @@ class Settings(BaseModel):
     model_api_key: str = ""
     extraction_allowed_hosts: tuple[str, ...] = ()
     mineru_command: str = "mineru"
+    mineru_backend: str = "pipeline"
     mineru_timeout_seconds: int = 600
     max_download_bytes: int = 52 * 1024 * 1024
 
@@ -30,6 +31,7 @@ class Settings(BaseModel):
             model_api_key=os.getenv("MODEL_API_KEY", ""),
             extraction_allowed_hosts=hosts,
             mineru_command=os.getenv("MINERU_COMMAND", "mineru"),
+            mineru_backend=os.getenv("MINERU_BACKEND", "pipeline"),
             mineru_timeout_seconds=int(os.getenv("MINERU_TIMEOUT_SECONDS", "600")),
         )
 

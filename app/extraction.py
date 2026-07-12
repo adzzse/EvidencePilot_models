@@ -50,6 +50,7 @@ async def extract_from_url(payload: ExtractRequest, settings: Settings) -> Extra
                 Path(temp_dir) / "output",
                 settings.mineru_timeout_seconds,
                 settings.mineru_command,
+                settings.mineru_backend,
             )
             method = "mineru"
         else:
@@ -82,6 +83,7 @@ async def extract_with_mineru(
     output_dir: Path,
     timeout_seconds: int,
     command: str,
+    backend: str,
 ) -> str:
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -91,6 +93,8 @@ async def extract_with_mineru(
             str(pdf_path),
             "-o",
             str(output_dir),
+            "--backend",
+            backend,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -105,7 +109,7 @@ async def extract_with_mineru(
         raise ExtractionUnavailableError(f"MinerU timed out after {timeout_seconds}s") from exc
 
     if process.returncode != 0:
-        detail = stderr.decode(errors="replace")[:500]
+        detail = stderr.decode(errors="replace")[-2000:]
         raise ExtractionUnavailableError(f"MinerU failed: {detail}")
 
     return _read_mineru_markdown(output_dir, pdf_path.stem)

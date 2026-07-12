@@ -26,6 +26,7 @@ separate Windows virtual environment, for example:
 
 ```dotenv
 MINERU_COMMAND=.venv-mineru\Scripts\mineru.exe
+MINERU_BACKEND=pipeline
 ```
 
 Create the generation model once:
