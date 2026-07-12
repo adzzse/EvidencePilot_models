@@ -1,14 +1,15 @@
-# EvidencePilot Python AI Worker
+# EvidencePilot Python Model Service
 
-Stateless FastAPI worker for the Java backend.
+Stateless FastAPI service called by the Java backend. It has no RabbitMQ, MinIO,
+Qdrant, or application database access.
 
-Java owns uploads, persistence, source/chunk/reference records, graph JSON, auth, projects, datasets, and orchestration. This service only runs AI worker functions:
+- PDF extraction: MinerU (`mineru` CLI)
+- DOCX extraction: LiteParse
+- Text generation: Ollama
+- Single and batch embeddings: Ollama `nomic-embed-text`
 
-- LiteParse document extraction
-- Ollama text generation and claim analysis
-- Ollama embeddings
-
-The Java backend calls this service with `AI_MODEL_BASE_URL`, for example `AI_MODEL_BASE_URL=http://host.docker.internal:8000`.
+Java remains responsible for upload state, queue consumption, Markdown/chunk
+persistence, vector indexing, retries, and the final `READY` status.
 
 ## Setup
 
@@ -20,11 +21,24 @@ pip install -r requirements-dev.txt
 Copy-Item .env.example .env
 ```
 
-Build the project Ollama model once:
+Install MinerU separately, then set `MINERU_COMMAND` to its executable. For a
+separate Windows virtual environment, for example:
+
+```dotenv
+MINERU_COMMAND=.venv-mineru\Scripts\mineru.exe
+```
+
+Create the generation model once:
 
 ```powershell
 ollama create evidencopilot -f Modelfile
 ```
+
+Set `MODEL_API_KEY` to the same value as Java's `AI_MODEL_API_KEY`. Set
+`EXTRACTION_ALLOWED_HOSTS` to the hostname used by Java's presigned MinIO URLs;
+use a comma-separated list when more than one hostname is required. That MinIO
+hostname must be reachable from this machine, so a Railway-private hostname is
+not suitable for the presigned download URL.
 
 ## Run
 
@@ -34,135 +48,75 @@ cd E:\Code\SEP490\EvidencePilot_models
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-For detailed logs:
+`GET /health` is public. Every `POST` route requires `X-API-Key`.
 
-```powershell
-$env:LOG_LEVEL = 'DEBUG'
-uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+## API contract
 
-## Endpoints
-
-`GET /health`
-
-Returns service, Ollama model, embedding model, and LiteParse package health.
-
-```json
-{
-  "status": "ok",
-  "model": "evidencopilot:latest",
-  "embedding_model": "nomic-embed-text",
-  "ollama": {
-    "ok": true,
-    "model_available": true,
-    "embedding_model_available": true
-  },
-  "liteparse": {
-    "ok": true,
-    "package": "liteparse"
-  }
-}
-```
+### Extract a document
 
 `POST /extract`
 
-Multipart form field: `file`
-
-Returns extracted Markdown only. It does not create source records or persist upload state.
-
 ```json
 {
-  "filename": "original.pdf",
-  "method": "liteparse",
-  "markdown": "# Extracted document\n\n..."
+  "document_id": "d6bde32d-d789-4ea0-a028-754bcd72912b",
+  "filename": "paper.pdf",
+  "content_type": "application/pdf",
+  "download_url": "https://storage.example.com/presigned-object"
 }
 ```
 
-PowerShell example:
-
-```powershell
-curl.exe -X POST http://127.0.0.1:8000/extract `
-  -F "file=@E:\Code\SEP490\sources\example.pdf"
-```
-
-`POST /ai/embeddings`
+The service downloads only an allowlisted URL and returns Markdown without
+persisting it:
 
 ```json
 {
-  "text": "Evidence traceability links claims to source material."
+  "filename": "paper.pdf",
+  "method": "mineru",
+  "markdown": "# Extracted document"
 }
 ```
 
-Response:
+Only `.pdf` and `.docx` are accepted. DOCX responses use `"method": "liteparse"`.
 
-```json
-{
-  "embedding": [0.1, -0.2, 0.3]
-}
-```
+### Generate text
 
 `POST /ai/generate`
 
 ```json
-{
-  "prompt": "Explain evidence traceability."
-}
+{"prompt": "Explain evidence traceability."}
 ```
 
-Response:
+### Embed one text
+
+`POST /ai/embeddings`
 
 ```json
-{
-  "model": "evidencopilot:latest",
-  "response": "Generated text...",
-  "done": true
-}
+{"text": "Evidence traceability links claims to sources."}
 ```
 
-`POST /process/claim`
+### Embed a batch
 
-Kept for Java flows that still delegate claim verdict/explanation generation.
+`POST /ai/embeddings/batch`
 
 ```json
-{
-  "claim": "Traceable evidence improves review quality.",
-  "source_id": "source-1",
-  "title": "agile-risk-management.pdf",
-  "excerpt": "Evidence traceability links claims to source material..."
-}
+{"texts": ["First chunk", "Second chunk"]}
 ```
 
-Response:
-
-```json
-{
-  "verdict": "supported",
-  "confidence": 0.92,
-  "matched_source_ids": ["source-1"],
-  "missing_evidence": [],
-  "explanation": "The provided source directly supports the claim."
-}
-```
+The batch endpoint accepts 1-64 texts and preserves input order.
 
 ## Ngrok
 
-Start the local API and expose it through ngrok:
+Expose the local service when Java runs remotely on Railway:
 
 ```powershell
-cd E:\Code\SEP490\EvidencePilot_models
-.\.venv\Scripts\Activate.ps1
 python scripts\start_ngrok_tunnel.py
 ```
 
-If the backend is already running in another terminal, start only the tunnel:
-
-```powershell
-python scripts\start_ngrok_tunnel.py --no-server
-```
+Configure Railway's `AI_MODEL_BASE_URL` with the HTTPS tunnel URL and use the
+same API key on both services.
 
 ## Tests
 
 ```powershell
-cd E:\Code\SEP490\EvidencePilot_models
 .\.venv\Scripts\python.exe -m pytest -q
 ```
