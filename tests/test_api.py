@@ -138,11 +138,14 @@ def test_extraction_routes_pdf_to_configured_mineru(monkeypatch):
         download_url="https://storage.test/paper.pdf",
     )
 
-    settings = SETTINGS.model_copy(update={"mineru_command": "C:/tools/mineru.exe"})
+    settings = SETTINGS.model_copy(update={
+        "mineru_command": "C:/tools/mineru.exe",
+        "mineru_backend": "pipeline",
+    })
     result = asyncio.run(extract_from_url(payload, settings))
     assert result.method == "mineru"
     assert result.markdown == "# Extracted"
-    assert received["args"][-1] == "C:/tools/mineru.exe"
+    assert received["args"][-2:] == ("C:/tools/mineru.exe", "pipeline")
 
 
 def test_extraction_routes_docx_to_liteparse(monkeypatch):
@@ -175,7 +178,9 @@ def test_mineru_reads_markdown_from_current_output_layout(tmp_path):
 
 def test_settings_reads_mineru_command(monkeypatch):
     monkeypatch.setenv("MINERU_COMMAND", "C:/tools/mineru.exe")
+    monkeypatch.setenv("MINERU_BACKEND", "pipeline")
 
     settings = Settings.from_env()
 
     assert getattr(settings, "mineru_command", None) == "C:/tools/mineru.exe"
+    assert settings.mineru_backend == "pipeline"
