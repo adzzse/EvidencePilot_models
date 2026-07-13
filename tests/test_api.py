@@ -1,4 +1,6 @@
 import asyncio
+import json
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -6,8 +8,8 @@ from fastapi.testclient import TestClient
 
 import app.extraction as extraction
 import app.main as main
-from app.extraction import ExtractedMarkdown, extract_from_url
-from app.models import ExtractRequest, GenerateResponse
+from app.extraction import ExtractionError, ExtractionUnavailableError, extract_from_url
+from app.models import ExtractRequest, ExtractionBlock, GenerateResponse
 from app.settings import Settings
 
 
@@ -84,10 +86,37 @@ def test_batch_rejects_more_than_64_texts(client: TestClient):
     assert response.status_code == 422
 
 
-def test_extract_returns_markdown(client: TestClient, monkeypatch):
+def test_extract_returns_markdown_and_blocks(client: TestClient, monkeypatch):
     async def extract(payload, _):
         assert payload.filename == "paper.pdf"
-        return ExtractedMarkdown("paper.pdf", "mineru", "# Paper")
+        return SimpleNamespace(
+            markdown="# Paper",
+            blocks=[{"type": "heading", "text": "Paper", "level": 1}],
+        )
+
+    monkeypatch.setattr(main, "extract_from_url", extract)
+    response = client.post(
+        "/extract",
+        headers=HEADERS,
+        json={
+            "filename": "paper.pdf",
+            "download_url": "https://storage.test/paper.pdf?signature=test",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "markdown": "# Paper",
+        "blocks": [{"type": "heading", "text": "Paper", "level": 1, "caption": None}],
+    }
+
+
+def test_extract_rejects_removed_request_fields(client: TestClient, monkeypatch):
+    async def extract(*_):
+        return SimpleNamespace(
+            markdown="# Paper",
+            blocks=[{"type": "heading", "text": "Paper", "level": 1}],
+        )
 
     monkeypatch.setattr(main, "extract_from_url", extract)
     response = client.post(
@@ -97,12 +126,11 @@ def test_extract_returns_markdown(client: TestClient, monkeypatch):
             "document_id": str(uuid4()),
             "filename": "paper.pdf",
             "content_type": "application/pdf",
-            "download_url": "https://storage.test/paper.pdf?signature=test",
+            "download_url": "https://storage.test/paper.pdf",
         },
     )
 
-    assert response.status_code == 200
-    assert response.json()["method"] == "mineru"
+    assert response.status_code == 422
 
 
 def test_extract_rejects_untrusted_download_host(client: TestClient):
@@ -110,9 +138,7 @@ def test_extract_rejects_untrusted_download_host(client: TestClient):
         "/extract",
         headers=HEADERS,
         json={
-            "document_id": str(uuid4()),
             "filename": "paper.pdf",
-            "content_type": "application/pdf",
             "download_url": "https://evil.test/paper.pdf",
         },
     )
@@ -121,20 +147,23 @@ def test_extract_rejects_untrusted_download_host(client: TestClient):
 
 def test_extraction_routes_pdf_to_configured_mineru(monkeypatch):
     received = {}
+    blocks = (SimpleNamespace(type="paragraph", text="Extracted", level=None, caption=None),)
 
     async def download(*_):
         return None
 
     async def mineru(*args):
         received["args"] = args
-        return "# Extracted"
+        return SimpleNamespace(
+            markdown="# Extracted",
+            blocks=blocks,
+            replace=lambda *args: "# Extracted".replace(*args),
+        )
 
     monkeypatch.setattr("app.extraction._download", download)
     monkeypatch.setattr("app.extraction.extract_with_mineru", mineru)
     payload = ExtractRequest(
-        document_id=uuid4(),
         filename="paper.pdf",
-        content_type="application/pdf",
         download_url="https://storage.test/paper.pdf",
     )
 
@@ -143,37 +172,78 @@ def test_extraction_routes_pdf_to_configured_mineru(monkeypatch):
         "mineru_backend": "pipeline",
     })
     result = asyncio.run(extract_from_url(payload, settings))
-    assert result.method == "mineru"
     assert result.markdown == "# Extracted"
+    assert result.blocks == blocks
     assert received["args"][-2:] == ("C:/tools/mineru.exe", "pipeline")
 
 
-def test_extraction_routes_docx_to_liteparse(monkeypatch):
-    async def download(*_):
-        return None
-
-    monkeypatch.setattr("app.extraction._download", download)
-    monkeypatch.setattr("app.extraction.extract_with_liteparse", lambda _: "# Extracted")
+def test_extraction_rejects_docx():
     payload = ExtractRequest(
-        document_id=uuid4(),
         filename="paper.docx",
-        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         download_url="https://storage.test/paper.docx",
     )
 
-    result = asyncio.run(extract_from_url(payload, SETTINGS))
-    assert result.method == "liteparse"
-    assert result.markdown == "# Extracted"
+    with pytest.raises(ExtractionError, match="only PDF files are supported"):
+        asyncio.run(extract_from_url(payload, SETTINGS))
 
 
-def test_mineru_reads_markdown_from_current_output_layout(tmp_path):
-    markdown_path = tmp_path / "input" / "hybrid_auto" / "input.md"
+def test_mineru_reads_markdown_and_normalizes_blocks(tmp_path):
+    output_dir = tmp_path / "input" / "hybrid_auto"
+    markdown_path = output_dir / "input.md"
     markdown_path.parent.mkdir(parents=True)
     markdown_path.write_text("# Extracted", encoding="utf-8")
+    (output_dir / "input_content_list.json").write_text(
+        json.dumps([
+            {"type": "text", "text": "Results", "text_level": 2},
+            {"type": "text", "text": "A result paragraph."},
+            {
+                "type": "table",
+                "table_caption": ["Table 1"],
+                "table_body": (
+                    "<table><thead><tr><th>A</th><th>B</th></tr></thead>"
+                    "<tbody><tr><td>1</td><td>2</td></tr></tbody></table>"
+                ),
+            },
+            {"type": "image", "image_caption": ["Figure 1. Architecture"]},
+            {"type": "text", "text": "References", "text_level": 1},
+            {"type": "list", "sub_type": "ref_text", "text": "Smith 2024"},
+        ]),
+        encoding="utf-8",
+    )
 
-    read_output = getattr(extraction, "_read_mineru_markdown", None)
+    read_output = getattr(extraction, "_read_mineru_output", None)
     assert read_output is not None
-    assert read_output(tmp_path, "input") == "# Extracted"
+    result = read_output(tmp_path, "input")
+
+    assert result.markdown == "# Extracted"
+    assert [block.type for block in result.blocks] == [
+        "heading",
+        "paragraph",
+        "table",
+        "figure_caption",
+        "reference",
+        "reference",
+    ]
+    assert result.blocks[2].caption == "Table 1"
+    assert result.blocks[2].text == "| A | B |\n| --- | --- |\n| 1 | 2 |"
+
+
+def test_mineru_requires_content_list(tmp_path):
+    output_dir = tmp_path / "input" / "hybrid_auto"
+    output_dir.mkdir(parents=True)
+    (output_dir / "input.md").write_text("# Extracted", encoding="utf-8")
+
+    read_output = getattr(extraction, "_read_mineru_output", None)
+    assert read_output is not None
+    with pytest.raises(ExtractionUnavailableError, match="content list"):
+        read_output(tmp_path, "input")
+
+
+def test_extraction_block_level_is_only_valid_for_headings():
+    with pytest.raises(ValueError):
+        ExtractionBlock(type="heading", text="Methods")
+    with pytest.raises(ValueError):
+        ExtractionBlock(type="paragraph", text="Body", level=2)
 
 
 def test_settings_reads_mineru_command(monkeypatch):

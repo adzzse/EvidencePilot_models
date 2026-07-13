@@ -63,7 +63,7 @@ async def extract_document(
     settings: Settings = Depends(get_settings),
 ) -> ExtractResponse:
     result = await extract_from_url(payload, settings)
-    return ExtractResponse(filename=result.filename, method=result.method, markdown=result.markdown)
+    return ExtractResponse(markdown=result.markdown, blocks=result.blocks)
 
 
 @app.post("/ai/generate", response_model=GenerateResponse, dependencies=[Depends(require_api_key)])
