@@ -1,22 +1,46 @@
 from typing import Literal
-from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 class ExtractRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    document_id: UUID
     filename: str = Field(min_length=1, max_length=255)
-    content_type: str = Field(min_length=1, max_length=255)
     download_url: HttpUrl
 
 
+class ExtractionBlock(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[
+        "heading",
+        "paragraph",
+        "list",
+        "table",
+        "figure_caption",
+        "equation",
+        "code",
+        "reference",
+    ]
+    text: str = Field(min_length=1)
+    level: int | None = Field(default=None, ge=1, le=6)
+    caption: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_level(self):
+        if self.type == "heading" and self.level is None:
+            raise ValueError("heading blocks require level")
+        if self.type != "heading" and self.level is not None:
+            raise ValueError("level is only valid for heading blocks")
+        return self
+
+
 class ExtractResponse(BaseModel):
-    filename: str
-    method: Literal["mineru", "liteparse"]
+    model_config = ConfigDict(extra="forbid")
+
     markdown: str = Field(min_length=1)
+    blocks: list[ExtractionBlock] = Field(min_length=1)
 
 
 class GenerateRequest(BaseModel):

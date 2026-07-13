@@ -4,7 +4,6 @@ Stateless FastAPI service called by the Java backend. It has no RabbitMQ, MinIO,
 Qdrant, or application database access.
 
 - PDF extraction: MinerU (`mineru` CLI)
-- DOCX extraction: LiteParse
 - Text generation: Ollama
 - Single and batch embeddings: Ollama `nomic-embed-text`
 
@@ -59,25 +58,26 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ```json
 {
-  "document_id": "d6bde32d-d789-4ea0-a028-754bcd72912b",
   "filename": "paper.pdf",
-  "content_type": "application/pdf",
   "download_url": "https://storage.example.com/presigned-object"
 }
 ```
 
-The service downloads only an allowlisted URL and returns Markdown without
-persisting it:
+The service downloads only an allowlisted PDF and returns Markdown with
+normalized content blocks without persisting them:
 
 ```json
 {
-  "filename": "paper.pdf",
-  "method": "mineru",
-  "markdown": "# Extracted document"
+  "markdown": "# Extracted document",
+  "blocks": [
+    {"type": "heading", "text": "Extracted document", "level": 1},
+    {"type": "paragraph", "text": "First paragraph."}
+  ]
 }
 ```
 
-Only `.pdf` and `.docx` are accepted. DOCX responses use `"method": "liteparse"`.
+Only `.pdf` files are accepted. Blocks use the types `heading`, `paragraph`,
+`list`, `table`, `figure_caption`, `equation`, `code`, and `reference`.
 
 ### Generate text
 
