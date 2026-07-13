@@ -32,7 +32,7 @@ class ExtractedMarkdown:
 
 async def extract_from_url(payload: ExtractRequest, settings: Settings) -> ExtractedMarkdown:
     host = (urlparse(str(payload.download_url)).hostname or "").lower()
-    if not settings.extraction_allowed_hosts or host not in settings.extraction_allowed_hosts:
+    if settings.extraction_allowed_hosts and host not in settings.extraction_allowed_hosts:
         raise ExtractionError("download_url host is not allowed")
 
     filename = Path(payload.filename).name
