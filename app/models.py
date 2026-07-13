@@ -11,7 +11,7 @@ class ExtractRequest(BaseModel):
 
 
 class ExtractionBlock(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
 
     type: Literal[
         "heading",

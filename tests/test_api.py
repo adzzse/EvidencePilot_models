@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 import app.extraction as extraction
 import app.main as main
-from app.extraction import ExtractionError, ExtractionUnavailableError, extract_from_url
+from app.extraction import (
+    ExtractionBlock as MinerUExtractionBlock,
+    ExtractionError,
+    ExtractionUnavailableError,
+    extract_from_url,
+)
 from app.models import ExtractRequest, ExtractionBlock, GenerateResponse
 from app.settings import Settings
 
@@ -86,23 +91,24 @@ def test_batch_rejects_more_than_64_texts(client: TestClient):
     assert response.status_code == 422
 
 
-def test_extract_returns_markdown_and_blocks(client: TestClient, monkeypatch):
+def test_extract_serializes_mineru_blocks(monkeypatch):
     async def extract(payload, _):
         assert payload.filename == "paper.pdf"
         return SimpleNamespace(
             markdown="# Paper",
-            blocks=[{"type": "heading", "text": "Paper", "level": 1}],
+            blocks=(MinerUExtractionBlock("heading", "Paper", level=1),),
         )
 
     monkeypatch.setattr(main, "extract_from_url", extract)
-    response = client.post(
-        "/extract",
-        headers=HEADERS,
-        json={
-            "filename": "paper.pdf",
-            "download_url": "https://storage.test/paper.pdf?signature=test",
-        },
-    )
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/extract",
+            headers=HEADERS,
+            json={
+                "filename": "paper.pdf",
+                "download_url": "https://storage.test/paper.pdf?signature=test",
+            },
+        )
 
     assert response.status_code == 200
     assert response.json() == {
