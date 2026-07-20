@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -181,6 +182,20 @@ def test_extraction_routes_pdf_to_configured_mineru(monkeypatch):
     assert result.markdown == "# Extracted"
     assert result.blocks == blocks
     assert received["args"][-2:] == ("C:/tools/mineru.exe", "pipeline")
+
+
+def test_mineru_logs_output_before_stream_ends(caplog):
+    async def stream() -> bytes:
+        reader = asyncio.StreamReader()
+        task = asyncio.create_task(extraction._stream_mineru_output(reader))
+        reader.feed_data(b"Processing page 1\n")
+        await asyncio.sleep(0)
+        assert "MinerU: Processing page 1" in caplog.text
+        reader.feed_eof()
+        return await task
+
+    with caplog.at_level(logging.INFO, logger=extraction.__name__):
+        assert asyncio.run(stream()) == b"Processing page 1\n"
 
 
 def test_extraction_rejects_docx():

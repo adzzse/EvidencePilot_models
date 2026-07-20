@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import tempfile
 from dataclasses import dataclass
@@ -82,6 +83,16 @@ async def _download(url: str, destination: Path, max_bytes: int) -> None:
         raise ExtractionUnavailableError("could not download the source document") from exc
 
 
+async def _stream_mineru_output(stream: asyncio.StreamReader) -> bytes:
+    output = bytearray()
+    async for line in stream:
+        output.extend(line)
+        message = line.decode(errors="replace").rstrip()
+        if message:
+            logger.info("MinerU: %s", message)
+    return bytes(output)
+
+
 async def extract_with_mineru(
     pdf_path: Path,
     output_dir: Path,
@@ -101,17 +112,24 @@ async def extract_with_mineru(
             backend,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
     except OSError as exc:
         raise ExtractionUnavailableError(f"MinerU executable is not available: {command}") from exc
 
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_task = asyncio.create_task(_stream_mineru_output(process.stdout))
+    stderr_task = asyncio.create_task(_stream_mineru_output(process.stderr))
     try:
-        _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
     except asyncio.TimeoutError as exc:
         process.kill()
         await process.wait()
+        await asyncio.gather(stdout_task, stderr_task)
         raise ExtractionUnavailableError(f"MinerU timed out after {timeout_seconds}s") from exc
 
+    _, stderr = await asyncio.gather(stdout_task, stderr_task)
     if process.returncode != 0:
         detail = stderr.decode(errors="replace")[-2000:]
         raise ExtractionUnavailableError(f"MinerU failed: {detail}")
