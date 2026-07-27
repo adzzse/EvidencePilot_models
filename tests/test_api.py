@@ -3,8 +3,10 @@ import json
 import logging
 from types import SimpleNamespace
 from uuid import uuid4
+from zipfile import ZipFile
 
 import pytest
+from docx import Document as WordDocument
 from fastapi.testclient import TestClient
 
 import app.extraction as extraction
@@ -198,14 +200,148 @@ def test_mineru_logs_output_before_stream_ends(caplog):
         assert asyncio.run(stream()) == b"Processing page 1\n"
 
 
-def test_extraction_rejects_docx():
+def test_extraction_routes_markdown_to_structured_blocks(monkeypatch):
+    async def download(_, destination, __):
+        destination.write_text(
+            "# Methods\n\n"
+            "A result paragraph.\n\n"
+            "| Metric | Value |\n"
+            "| --- | --- |\n"
+            "| Recall | 0.91 |\n\n"
+            "# References\n\n"
+            "Smith 2024",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("app.extraction._download", download)
     payload = ExtractRequest(
-        filename="paper.docx",
-        download_url="https://storage.test/paper.docx",
+        filename="source.markdown",
+        download_url="https://storage.test/source.markdown",
     )
 
-    with pytest.raises(ExtractionError, match="only PDF files are supported"):
+    result = asyncio.run(extract_from_url(payload, SETTINGS))
+
+    assert result.markdown.startswith("# Methods")
+    assert [block.type for block in result.blocks] == [
+        "heading",
+        "paragraph",
+        "table",
+        "reference",
+        "reference",
+    ]
+    assert result.blocks[2].text.endswith("| Recall | 0.91 |")
+
+
+def test_extraction_rejects_non_utf8_markdown(monkeypatch):
+    async def download(_, destination, __):
+        destination.write_bytes(b"\xff\xfe\x00")
+
+    monkeypatch.setattr("app.extraction._download", download)
+    payload = ExtractRequest(
+        filename="source.md",
+        download_url="https://storage.test/source.md",
+    )
+
+    with pytest.raises(ExtractionError, match="UTF-8"):
         asyncio.run(extract_from_url(payload, SETTINGS))
+
+
+def test_markdown_parser_preserves_setext_lists_and_fenced_code():
+    result = extraction._document_from_markdown(
+        "Results\n"
+        "=======\n\n"
+        "- first\n"
+        "- second\n\n"
+        "```python\n"
+        "print('ok')\n"
+        "```"
+    )
+
+    assert [block.type for block in result.blocks] == ["heading", "list", "code"]
+    assert result.blocks[0].level == 1
+    assert result.blocks[1].text == "- first\n- second"
+    assert result.blocks[2].text == "print('ok')"
+
+
+def test_extraction_routes_docx_to_structured_blocks(monkeypatch):
+    async def download(_, destination, __):
+        document = WordDocument()
+        document.add_heading("Methods", level=1)
+        document.add_paragraph("A result paragraph.")
+        document.add_paragraph("First item", style="List Bullet")
+        table = document.add_table(rows=2, cols=2)
+        table.rows[0].cells[0].text = "Metric"
+        table.rows[0].cells[1].text = "Value"
+        table.rows[1].cells[0].text = "Recall"
+        table.rows[1].cells[1].text = "0.91"
+        document.add_heading("References", level=1)
+        document.add_paragraph("Smith 2024")
+        document.save(destination)
+
+    monkeypatch.setattr("app.extraction._download", download)
+    payload = ExtractRequest(
+        filename="source.docx",
+        download_url="https://storage.test/source.docx",
+    )
+
+    result = asyncio.run(extract_from_url(payload, SETTINGS))
+
+    assert result.markdown.startswith("# Methods")
+    assert [block.type for block in result.blocks] == [
+        "heading",
+        "paragraph",
+        "list",
+        "table",
+        "reference",
+        "reference",
+    ]
+    assert "| Recall | 0.91 |" in result.blocks[3].text
+
+
+def test_extraction_rejects_invalid_docx(monkeypatch):
+    async def download(_, destination, __):
+        destination.write_bytes(b"not-a-docx")
+
+    monkeypatch.setattr("app.extraction._download", download)
+    payload = ExtractRequest(
+        filename="source.docx",
+        download_url="https://storage.test/source.docx",
+    )
+
+    with pytest.raises(ExtractionError, match="DOCX file is invalid"):
+        asyncio.run(extract_from_url(payload, SETTINGS))
+
+
+def test_extraction_rejects_docx_expanding_beyond_limit(monkeypatch):
+    async def download(_, destination, __):
+        with ZipFile(destination, "w") as archive:
+            archive.writestr("[Content_Types].xml", b"x" * 101)
+
+    monkeypatch.setattr("app.extraction._download", download)
+    payload = ExtractRequest(
+        filename="source.docx",
+        download_url="https://storage.test/source.docx",
+    )
+    settings = SETTINGS.model_copy(update={"max_download_bytes": 100})
+
+    with pytest.raises(ExtractionError, match="DOCX content exceeds"):
+        asyncio.run(extract_from_url(payload, settings))
+
+
+def test_extract_rejects_tex_with_422(client: TestClient):
+    response = client.post(
+        "/extract",
+        headers=HEADERS,
+        json={
+            "filename": "source.tex",
+            "download_url": "https://storage.test/source.tex",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "only PDF, DOCX, and Markdown files are supported"
+    }
 
 
 def test_mineru_reads_markdown_and_normalizes_blocks(tmp_path):

@@ -9,14 +9,27 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from zipfile import ZipFile
 
 import httpx
+from docx import Document as load_docx
+from docx.table import Table as DocxTable
+from docx.text.paragraph import Paragraph as DocxParagraph
 
 from app.models import ExtractRequest
 from app.settings import Settings
 
 
 logger = logging.getLogger(__name__)
+
+
+SUPPORTED_SUFFIXES = {".pdf", ".docx", ".md", ".markdown"}
+_ATX_HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)\s*$")
+_SETEXT_HEADING = re.compile(r"^\s*(=+|-+)\s*$")
+_LIST_ITEM = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s+")
+_TABLE_SEPARATOR = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
 
 
 class ExtractionError(ValueError):
@@ -48,19 +61,28 @@ async def extract_from_url(payload: ExtractRequest, settings: Settings) -> Extra
 
     filename = Path(payload.filename).name
     suffix = Path(filename).suffix.lower()
-    if suffix != ".pdf":
-        raise ExtractionError("only PDF files are supported")
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise ExtractionError("only PDF, DOCX, and Markdown files are supported")
 
     with tempfile.TemporaryDirectory(prefix="evidencepilot-extract-") as temp_dir:
-        input_path = Path(temp_dir) / "input.pdf"
+        input_path = Path(temp_dir) / f"input{suffix}"
         await _download(str(payload.download_url), input_path, settings.max_download_bytes)
-        result = await extract_with_mineru(
-            input_path,
-            Path(temp_dir) / "output",
-            settings.mineru_timeout_seconds,
-            settings.mineru_command,
-            settings.mineru_backend,
-        )
+        if suffix == ".pdf":
+            result = await extract_with_mineru(
+                input_path,
+                Path(temp_dir) / "output",
+                settings.mineru_timeout_seconds,
+                settings.mineru_command,
+                settings.mineru_backend,
+            )
+        elif suffix == ".docx":
+            result = await asyncio.to_thread(
+                _read_docx,
+                input_path,
+                settings.max_download_bytes,
+            )
+        else:
+            result = _read_markdown(input_path)
 
     return ExtractedDocument(_clean(result.markdown), tuple(result.blocks))
 
@@ -246,6 +268,180 @@ def _clean_block_text(text: str) -> str:
 def _is_reference_heading(text: str) -> bool:
     normalized = re.sub(r"[^a-z]+", " ", text.lower()).strip()
     return normalized in {"references", "bibliography", "works cited"}
+
+
+def _read_markdown(path: Path) -> ExtractedDocument:
+    try:
+        markdown = path.read_text(encoding="utf-8-sig")
+    except UnicodeError as exc:
+        raise ExtractionError("Markdown files must be UTF-8") from exc
+    return _document_from_markdown(markdown)
+
+
+def _document_from_markdown(markdown: str) -> ExtractedDocument:
+    cleaned = _clean(markdown)
+    blocks = _mark_reference_blocks(_parse_markdown_blocks(cleaned))
+    if not blocks:
+        raise ExtractionError("no text could be extracted from the document")
+    return ExtractedDocument(cleaned, tuple(blocks))
+
+
+def _parse_markdown_blocks(markdown: str) -> list[ExtractionBlock]:
+    lines = markdown.splitlines()
+    blocks: list[ExtractionBlock] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped:
+            index += 1
+            continue
+
+        heading = _ATX_HEADING.match(stripped)
+        if heading:
+            blocks.append(ExtractionBlock("heading", heading.group(2), len(heading.group(1))))
+            index += 1
+            continue
+
+        if index + 1 < len(lines) and _SETEXT_HEADING.match(lines[index + 1]):
+            marker = lines[index + 1].strip()
+            blocks.append(ExtractionBlock("heading", stripped, 1 if marker[0] == "=" else 2))
+            index += 2
+            continue
+
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[:3]
+            index += 1
+            body: list[str] = []
+            while index < len(lines) and not lines[index].strip().startswith(marker):
+                body.append(lines[index])
+                index += 1
+            if index < len(lines):
+                index += 1
+            text = "\n".join(body).strip()
+            if text:
+                blocks.append(ExtractionBlock("code", text))
+            continue
+
+        if (
+            index + 1 < len(lines)
+            and "|" in line
+            and _TABLE_SEPARATOR.match(lines[index + 1])
+        ):
+            table = [line.rstrip(), lines[index + 1].rstrip()]
+            index += 2
+            while index < len(lines) and lines[index].strip() and "|" in lines[index]:
+                table.append(lines[index].rstrip())
+                index += 1
+            blocks.append(ExtractionBlock("table", "\n".join(table)))
+            continue
+
+        if _LIST_ITEM.match(line):
+            items = [line.strip()]
+            index += 1
+            while index < len(lines) and lines[index].strip() and _LIST_ITEM.match(lines[index]):
+                items.append(lines[index].strip())
+                index += 1
+            blocks.append(ExtractionBlock("list", "\n".join(items)))
+            continue
+
+        paragraph = [stripped]
+        index += 1
+        while index < len(lines) and lines[index].strip():
+            next_line = lines[index]
+            if (
+                _ATX_HEADING.match(next_line.strip())
+                or next_line.strip().startswith(("```", "~~~"))
+                or _LIST_ITEM.match(next_line)
+                or (
+                    index + 1 < len(lines)
+                    and "|" in next_line
+                    and _TABLE_SEPARATOR.match(lines[index + 1])
+                )
+            ):
+                break
+            paragraph.append(next_line.strip())
+            index += 1
+        blocks.append(ExtractionBlock("paragraph", "\n".join(paragraph)))
+
+    return blocks
+
+
+def _mark_reference_blocks(blocks: list[ExtractionBlock]) -> list[ExtractionBlock]:
+    marked: list[ExtractionBlock] = []
+    reference_level: int | None = None
+
+    for block in blocks:
+        if block.type == "heading":
+            is_reference = _is_reference_heading(block.text)
+            if (
+                reference_level is not None
+                and block.level is not None
+                and block.level <= reference_level
+                and not is_reference
+            ):
+                reference_level = None
+            if is_reference:
+                reference_level = block.level
+
+        if reference_level is not None:
+            marked.append(ExtractionBlock("reference", block.text))
+        else:
+            marked.append(block)
+
+    return marked
+
+
+def _read_docx(path: Path, max_uncompressed_bytes: int) -> ExtractedDocument:
+    try:
+        with ZipFile(path) as archive:
+            uncompressed_bytes = sum(entry.file_size for entry in archive.infolist())
+        if uncompressed_bytes > max_uncompressed_bytes:
+            raise ExtractionError("DOCX content exceeds the extraction limit")
+        document = load_docx(path)
+    except ExtractionError:
+        raise
+    except Exception as exc:
+        raise ExtractionError("DOCX file is invalid") from exc
+
+    # ponytail: text/table extraction only; add image OCR if retrieval evaluation needs it.
+    parts: list[str] = []
+    for item in document.iter_inner_content():
+        if isinstance(item, DocxParagraph):
+            text = item.text.strip()
+            if not text:
+                continue
+            style_name = item.style.name if item.style is not None else ""
+            heading = re.fullmatch(r"Heading ([1-6])", style_name, re.IGNORECASE)
+            if heading:
+                parts.append(f"{'#' * int(heading.group(1))} {text}")
+            elif style_name.lower().startswith("list"):
+                parts.append(f"- {text}")
+            else:
+                parts.append(text)
+        elif isinstance(item, DocxTable):
+            table = _docx_table_to_markdown(item)
+            if table:
+                parts.append(table)
+
+    return _document_from_markdown("\n\n".join(parts))
+
+
+def _docx_table_to_markdown(table: DocxTable) -> str:
+    rows = [
+        [_markdown_cell(cell.text) for cell in row.cells]
+        for row in table.rows
+    ]
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    normalized = [row + [""] * (width - len(row)) for row in rows]
+    return "\n".join([
+        _markdown_row(normalized[0]),
+        _markdown_row(["---"] * width),
+        *(_markdown_row(row) for row in normalized[1:]),
+    ])
 
 
 class _TableParser(HTMLParser):
