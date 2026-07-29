@@ -4,9 +4,10 @@ import logging
 import os
 import re
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 from zipfile import ZipFile
@@ -16,7 +17,7 @@ from docx import Document as load_docx
 from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
 
-from app.models import ExtractRequest
+from app.models import ExtractionManifest, ExtractRequest
 from app.settings import Settings
 
 
@@ -52,9 +53,36 @@ class ExtractionBlock:
 class ExtractedDocument:
     markdown: str
     blocks: tuple[ExtractionBlock, ...]
+    images: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExtractionWorkProduct:
+    document: ExtractedDocument
+    image_files: tuple[tuple[str, Path], ...] = ()
 
 
 async def extract_from_url(payload: ExtractRequest, settings: Settings) -> ExtractedDocument:
+    with tempfile.TemporaryDirectory(prefix="evidencepilot-extract-") as temp_dir:
+        product = await _extract_in_work_dir(payload, settings, Path(temp_dir))
+    return product.document
+
+
+async def create_extraction_bundle(
+    payload: ExtractRequest,
+    settings: Settings,
+    destination: Path,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="evidencepilot-extract-") as temp_dir:
+        product = await _extract_in_work_dir(payload, settings, Path(temp_dir))
+        _write_extraction_bundle(product, destination)
+
+
+async def _extract_in_work_dir(
+    payload: ExtractRequest,
+    settings: Settings,
+    work_dir: Path,
+) -> ExtractionWorkProduct:
     host = (urlparse(str(payload.download_url)).hostname or "").lower()
     if settings.extraction_allowed_hosts and host not in settings.extraction_allowed_hosts:
         raise ExtractionError("download_url host is not allowed")
@@ -64,27 +92,42 @@ async def extract_from_url(payload: ExtractRequest, settings: Settings) -> Extra
     if suffix not in SUPPORTED_SUFFIXES:
         raise ExtractionError("only PDF, DOCX, and Markdown files are supported")
 
-    with tempfile.TemporaryDirectory(prefix="evidencepilot-extract-") as temp_dir:
-        input_path = Path(temp_dir) / f"input{suffix}"
-        await _download(str(payload.download_url), input_path, settings.max_download_bytes)
-        if suffix == ".pdf":
-            result = await extract_with_mineru(
-                input_path,
-                Path(temp_dir) / "output",
-                settings.mineru_timeout_seconds,
-                settings.mineru_command,
-                settings.mineru_backend,
-            )
-        elif suffix == ".docx":
-            result = await asyncio.to_thread(
-                _read_docx,
-                input_path,
-                settings.max_download_bytes,
-            )
-        else:
-            result = _read_markdown(input_path)
+    input_path = work_dir / f"input{suffix}"
+    await _download(str(payload.download_url), input_path, settings.max_download_bytes)
+    if suffix == ".pdf":
+        return await extract_with_mineru(
+            input_path,
+            work_dir / "output",
+            settings.mineru_timeout_seconds,
+            settings.mineru_command,
+            settings.mineru_backend,
+        )
+    if suffix == ".docx":
+        document = await asyncio.to_thread(
+            _read_docx,
+            input_path,
+            settings.max_download_bytes,
+        )
+    else:
+        document = _read_markdown(input_path)
+    return ExtractionWorkProduct(
+        ExtractedDocument(_clean(document.markdown), tuple(document.blocks)),
+    )
 
-    return ExtractedDocument(_clean(result.markdown), tuple(result.blocks))
+
+def _write_extraction_bundle(
+    product: ExtractionWorkProduct,
+    destination: Path,
+) -> None:
+    manifest = ExtractionManifest(
+        blocks=list(product.document.blocks),
+        images=list(product.document.images),
+    )
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("extraction.json", manifest.model_dump_json())
+        archive.writestr("document.md", product.document.markdown)
+        for archive_path, source_path in product.image_files:
+            archive.write(source_path, archive_path)
 
 
 async def _download(url: str, destination: Path, max_bytes: int) -> None:
@@ -121,7 +164,7 @@ async def extract_with_mineru(
     timeout_seconds: int,
     command: str,
     backend: str,
-) -> ExtractedDocument:
+) -> ExtractionWorkProduct:
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         process = await asyncio.create_subprocess_exec(
@@ -159,7 +202,7 @@ async def extract_with_mineru(
     return _read_mineru_output(output_dir, pdf_path.stem)
 
 
-def _read_mineru_output(output_dir: Path, document_stem: str) -> ExtractedDocument:
+def _read_mineru_output(output_dir: Path, document_stem: str) -> ExtractionWorkProduct:
     markdown_path = next(output_dir.rglob(f"{document_stem}.md"), None)
     if markdown_path is None:
         markdown_path = next(output_dir.rglob("result.md"), None)
@@ -182,7 +225,51 @@ def _read_mineru_output(output_dir: Path, document_stem: str) -> ExtractedDocume
     blocks = tuple(_normalize_mineru_blocks(content_list))
     if not blocks:
         raise ExtractionUnavailableError("MinerU produced no content blocks")
-    return ExtractedDocument(_clean(markdown_path.read_text(encoding="utf-8")), blocks)
+    image_files = _mineru_images(content_list, markdown_path.parent)
+    document = ExtractedDocument(
+        _clean(markdown_path.read_text(encoding="utf-8")),
+        blocks,
+        tuple(path for path, _ in image_files),
+    )
+    return ExtractionWorkProduct(document, image_files)
+
+
+def _mineru_images(
+    content_list: list[dict[str, Any]],
+    output_root: Path,
+) -> tuple[tuple[str, Path], ...]:
+    allowed = {".jpg", ".jpeg", ".png", ".webp"}
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    root = output_root.resolve()
+
+    for item in content_list:
+        raw = item.get("img_path") if isinstance(item, dict) else None
+        if not isinstance(raw, str) or not raw:
+            continue
+        relative = PurePosixPath(raw)
+        if (
+            relative.is_absolute()
+            or "\\" in raw
+            or ".." in relative.parts
+            or len(relative.parts) < 2
+            or relative.parts[0] != "images"
+            or relative.suffix.lower() not in allowed
+        ):
+            raise ExtractionUnavailableError("MinerU image path is invalid")
+        normalized = relative.as_posix()
+        source = (root / Path(*relative.parts)).resolve()
+        try:
+            source.relative_to(root)
+        except ValueError as exc:
+            raise ExtractionUnavailableError("MinerU image path is invalid") from exc
+        if not source.is_file():
+            raise ExtractionUnavailableError("MinerU image file is missing")
+        if normalized not in seen:
+            seen.add(normalized)
+            found.append((normalized, source))
+
+    return tuple(found)
 
 
 def _normalize_mineru_blocks(content_list: list[dict[str, Any]]) -> list[ExtractionBlock]:

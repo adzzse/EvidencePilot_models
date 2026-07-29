@@ -1,6 +1,8 @@
 import asyncio
+import io
 import json
 import logging
+import zipfile
 from types import SimpleNamespace
 from uuid import uuid4
 from zipfile import ZipFile
@@ -12,9 +14,10 @@ from fastapi.testclient import TestClient
 import app.extraction as extraction
 import app.main as main
 from app.extraction import (
-    ExtractionBlock as MinerUExtractionBlock,
+    ExtractedDocument,
     ExtractionError,
     ExtractionUnavailableError,
+    ExtractionWorkProduct,
     extract_from_url,
 )
 from app.models import ExtractRequest, ExtractionBlock, GenerateResponse
@@ -94,15 +97,23 @@ def test_batch_rejects_more_than_64_texts(client: TestClient):
     assert response.status_code == 422
 
 
-def test_extract_serializes_mineru_blocks(monkeypatch):
-    async def extract(payload, _):
+def test_extract_returns_bundle(monkeypatch):
+    async def create_bundle(payload, _, destination):
         assert payload.filename == "paper.pdf"
-        return SimpleNamespace(
-            markdown="# Paper",
-            blocks=(MinerUExtractionBlock("heading", "Paper", level=1),),
-        )
+        with zipfile.ZipFile(destination, "w") as archive:
+            archive.writestr(
+                "extraction.json",
+                json.dumps({
+                    "blocks": [
+                        {"type": "heading", "text": "Paper", "level": 1, "caption": None}
+                    ],
+                    "images": ["images/figure.jpg"],
+                }),
+            )
+            archive.writestr("document.md", "# Paper\n\n![](images/figure.jpg)")
+            archive.writestr("images/figure.jpg", b"jpeg")
 
-    monkeypatch.setattr(main, "extract_from_url", extract)
+    monkeypatch.setattr(main, "create_extraction_bundle", create_bundle)
     with TestClient(main.app, raise_server_exceptions=False) as client:
         response = client.post(
             "/extract",
@@ -114,20 +125,18 @@ def test_extract_serializes_mineru_blocks(monkeypatch):
         )
 
     assert response.status_code == 200
-    assert response.json() == {
-        "markdown": "# Paper",
-        "blocks": [{"type": "heading", "text": "Paper", "level": 1, "caption": None}],
-    }
+    assert response.headers["content-type"].startswith("application/zip")
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.namelist() == [
+            "extraction.json",
+            "document.md",
+            "images/figure.jpg",
+        ]
+        assert archive.read("document.md") == b"# Paper\n\n![](images/figure.jpg)"
+        assert archive.read("images/figure.jpg") == b"jpeg"
 
 
-def test_extract_rejects_removed_request_fields(client: TestClient, monkeypatch):
-    async def extract(*_):
-        return SimpleNamespace(
-            markdown="# Paper",
-            blocks=[{"type": "heading", "text": "Paper", "level": 1}],
-        )
-
-    monkeypatch.setattr(main, "extract_from_url", extract)
+def test_extract_rejects_removed_request_fields(client: TestClient):
     response = client.post(
         "/extract",
         headers=HEADERS,
@@ -163,10 +172,8 @@ def test_extraction_routes_pdf_to_configured_mineru(monkeypatch):
 
     async def mineru(*args):
         received["args"] = args
-        return SimpleNamespace(
-            markdown="# Extracted",
-            blocks=blocks,
-            replace=lambda *args: "# Extracted".replace(*args),
+        return ExtractionWorkProduct(
+            ExtractedDocument("# Extracted", blocks),
         )
 
     monkeypatch.setattr("app.extraction._download", download)
@@ -372,8 +379,8 @@ def test_mineru_reads_markdown_and_normalizes_blocks(tmp_path):
     assert read_output is not None
     result = read_output(tmp_path, "input")
 
-    assert result.markdown == "# Extracted"
-    assert [block.type for block in result.blocks] == [
+    assert result.document.markdown == "# Extracted"
+    assert [block.type for block in result.document.blocks] == [
         "heading",
         "paragraph",
         "table",
@@ -381,8 +388,49 @@ def test_mineru_reads_markdown_and_normalizes_blocks(tmp_path):
         "reference",
         "reference",
     ]
-    assert result.blocks[2].caption == "Table 1"
-    assert result.blocks[2].text == "| A | B |\n| --- | --- |\n| 1 | 2 |"
+    assert result.document.blocks[2].caption == "Table 1"
+    assert result.document.blocks[2].text == "| A | B |\n| --- | --- |\n| 1 | 2 |"
+
+
+def test_mineru_bundle_includes_referenced_image(tmp_path):
+    output_dir = tmp_path / "output"
+    document_dir = output_dir / "paper"
+    image_path = document_dir / "images" / "figure.jpg"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"jpeg")
+    (document_dir / "paper.md").write_text(
+        "# Result\n\n![](images/figure.jpg)",
+        encoding="utf-8",
+    )
+    (document_dir / "paper_content_list.json").write_text(
+        json.dumps([
+            {"type": "text", "text": "Result", "text_level": 1},
+            {"type": "image", "img_path": "images/figure.jpg"},
+        ]),
+        encoding="utf-8",
+    )
+
+    product = extraction._read_mineru_output(output_dir, "paper")
+
+    assert product.document.images == ("images/figure.jpg",)
+    assert product.image_files == (("images/figure.jpg", image_path),)
+
+
+def test_mineru_rejects_image_path_escape(tmp_path):
+    output_dir = tmp_path / "output"
+    document_dir = output_dir / "paper"
+    document_dir.mkdir(parents=True)
+    (document_dir / "paper.md").write_text("# Result", encoding="utf-8")
+    (document_dir / "paper_content_list.json").write_text(
+        json.dumps([
+            {"type": "text", "text": "Result", "text_level": 1},
+            {"type": "image", "img_path": "../secret.jpg"},
+        ]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExtractionUnavailableError, match="image path"):
+        extraction._read_mineru_output(output_dir, "paper")
 
 
 def test_mineru_requires_content_list(tmp_path):

@@ -36,11 +36,11 @@ class ExtractionBlock(BaseModel):
         return self
 
 
-class ExtractResponse(BaseModel):
+class ExtractionManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    markdown: str = Field(min_length=1)
     blocks: list[ExtractionBlock] = Field(min_length=1)
+    images: list[str] = Field(default_factory=list)
 
 
 class GenerateRequest(BaseModel):

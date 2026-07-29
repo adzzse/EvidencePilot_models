@@ -1,17 +1,24 @@
 import logging
+import os
 import secrets
+import tempfile
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
-from app.extraction import ExtractionError, ExtractionUnavailableError, extract_from_url
+from app.extraction import (
+    ExtractionError,
+    ExtractionUnavailableError,
+    create_extraction_bundle,
+)
 from app.models import (
     BatchEmbeddingRequest,
     BatchEmbeddingResponse,
     EmbeddingRequest,
     EmbeddingResponse,
     ExtractRequest,
-    ExtractResponse,
     GenerateRequest,
     GenerateResponse,
 )
@@ -57,13 +64,28 @@ async def health(settings: Settings = Depends(get_settings)) -> dict:
     }
 
 
-@app.post("/extract", response_model=ExtractResponse, dependencies=[Depends(require_api_key)])
+@app.post("/extract", dependencies=[Depends(require_api_key)])
 async def extract_document(
     payload: ExtractRequest,
     settings: Settings = Depends(get_settings),
-) -> ExtractResponse:
-    result = await extract_from_url(payload, settings)
-    return ExtractResponse(markdown=result.markdown, blocks=result.blocks)
+) -> FileResponse:
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix="evidencepilot-extraction-",
+        suffix=".zip",
+    )
+    os.close(descriptor)
+    bundle_path = Path(raw_path)
+    try:
+        await create_extraction_bundle(payload, settings, bundle_path)
+    except Exception:
+        bundle_path.unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        bundle_path,
+        media_type="application/zip",
+        filename="extraction.zip",
+        background=BackgroundTask(bundle_path.unlink, missing_ok=True),
+    )
 
 
 @app.post("/ai/generate", response_model=GenerateResponse, dependencies=[Depends(require_api_key)])
