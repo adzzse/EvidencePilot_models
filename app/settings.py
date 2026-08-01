@@ -6,8 +6,11 @@ from pydantic import BaseModel
 
 
 class Settings(BaseModel):
+    generation_provider: str = "auto"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.6-flash"
     ollama_base_url: str = "http://127.0.0.1:11434"
-    ollama_model: str = "evidencopilot:latest"
+    ollama_model: str = "qwen3.5:9b"
     ollama_embedding_model: str = "nomic-embed-text"
     model_api_key: str = ""
     extraction_allowed_hosts: tuple[str, ...] = ()
@@ -25,8 +28,11 @@ class Settings(BaseModel):
             if host.strip()
         )
         return cls(
+            generation_provider=os.getenv("GENERATION_PROVIDER", "auto").strip().lower(),
+            gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip(),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
-            ollama_model=os.getenv("OLLAMA_MODEL", "evidencopilot:latest"),
+            ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:9b"),
             ollama_embedding_model=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
             model_api_key=os.getenv("MODEL_API_KEY", ""),
             extraction_allowed_hosts=hosts,

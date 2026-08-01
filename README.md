@@ -6,7 +6,7 @@ Qdrant, or application database access.
 - PDF extraction: MinerU (`mineru` CLI)
 - DOCX extraction: `python-docx`, normalized to Markdown and structured blocks
 - Markdown extraction: direct UTF-8 normalization to structured blocks
-- Text generation: Ollama
+- Text generation: Gemini API or local Ollama
 - Single and batch embeddings: Ollama `nomic-embed-text`
 
 Java remains responsible for upload state, queue consumption, Markdown/chunk
@@ -30,17 +30,39 @@ MINERU_COMMAND=.venv-mineru\Scripts\mineru.exe
 MINERU_BACKEND=pipeline
 ```
 
-Create the generation model once:
+Pull the local generation and embedding models:
 
 ```powershell
-ollama create evidencopilot -f Modelfile
+ollama pull qwen3.5:9b
+ollama pull nomic-embed-text
 ```
+
+Generation provider configuration:
+
+```dotenv
+GENERATION_PROVIDER=auto
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-3.6-flash
+OLLAMA_MODEL=qwen3.5:9b
+```
+
+With `auto`, a non-empty `GEMINI_API_KEY` selects Gemini; otherwise generation
+uses local Ollama. Set `GENERATION_PROVIDER=ollama` to force local generation
+even when a Gemini key exists. Set it to `gemini` to require Gemini; a missing
+key is then a configuration error. Once Gemini is selected, an API failure is
+returned to the caller and is not silently retried through Ollama. Embeddings
+and document extraction always remain local. Generation context, including
+Claims, source chunks, paper sections, and feedback, is sent to Gemini when it
+is selected.
 
 Set `MODEL_API_KEY` to the same value as Java's `AI_MODEL_API_KEY`. Set
 `EXTRACTION_ALLOWED_HOSTS` to the hostname used by Java's presigned MinIO URLs;
 use a comma-separated list when more than one hostname is required. That MinIO
 hostname must be reachable from this machine, so a Railway-private hostname is
 not suitable for the presigned download URL.
+
+`MODEL_API_KEY` authenticates Java requests to this worker. It is unrelated to
+Google's `GEMINI_API_KEY`.
 
 ## Run
 
@@ -87,7 +109,22 @@ unsupported. Blocks use the types `heading`, `paragraph`, `list`, `table`,
 `POST /ai/generate`
 
 ```json
-{"prompt": "Explain evidence traceability."}
+{
+  "system": "Return one JSON object describing evidence traceability.",
+  "prompt": "{\"claim\":\"Evidence traceability links claims to sources.\"}"
+}
+```
+
+`system` is optional for backward compatibility. The response identifies the
+provider and actual model used:
+
+```json
+{
+  "provider": "gemini",
+  "model": "gemini-3.6-flash",
+  "response": "{\"supported\":true}",
+  "done": true
+}
 ```
 
 ### Embed one text
