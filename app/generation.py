@@ -68,27 +68,37 @@ class OpenAICompatibleGenerationProvider:
             "max_tokens": 8192,
             "stream": False,
         }
+        if self.settings.openai_compatible_model.startswith("deepseek-v4"):
+            payload["thinking"] = {"type": "disabled"}
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{self.settings.openai_compatible_base_url}/chat/completions",
-                    headers=self.headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-            data = response.json()
-            text = data["choices"][0]["message"]["content"]
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("missing generated text")
-            returned_model = data.get("model")
-            if returned_model is not None and not isinstance(returned_model, str):
-                raise TypeError("invalid model")
-            return GenerateResponse(
-                provider=self.name,
-                model=returned_model or self.settings.openai_compatible_model,
-                response=text.strip(),
-                done=True,
-            )
+                for attempt in range(2):
+                    response = await client.post(
+                        f"{self.settings.openai_compatible_base_url}/chat/completions",
+                        headers=self.headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    try:
+                        data = response.json()
+                        text = data["choices"][0]["message"]["content"]
+                        if not isinstance(text, str) or not text.strip():
+                            raise ValueError("missing generated text")
+                        returned_model = data.get("model")
+                        if returned_model is not None and not isinstance(
+                            returned_model, str
+                        ):
+                            raise TypeError("invalid model")
+                        return GenerateResponse(
+                            provider=self.name,
+                            model=returned_model
+                            or self.settings.openai_compatible_model,
+                            response=text.strip(),
+                            done=True,
+                        )
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        if attempt == 1:
+                            raise
         except httpx.HTTPError as exc:
             raise GenerationUnavailableError(
                 "OpenAI-compatible generation failed"

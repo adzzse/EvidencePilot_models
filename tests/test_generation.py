@@ -104,6 +104,7 @@ def test_openai_compatible_generation_uses_chat_completions(monkeypatch):
             ],
             "max_tokens": 8192,
             "stream": False,
+            "thinking": {"type": "disabled"},
         },
     }
 
@@ -137,6 +138,43 @@ def test_openai_compatible_rejects_malformed_response(monkeypatch):
 
     with pytest.raises(GenerationInvalidResponseError):
         asyncio.run(provider.generate("system", "prompt"))
+
+
+def test_openai_compatible_retries_malformed_response_once(monkeypatch):
+    responses = iter([
+        {"choices": []},
+        {"choices": [{"message": {"content": "{\"findings\":[]}"}}]},
+    ])
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return next(responses)
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    provider = select_generation_provider(Settings(
+        generation_provider="openai_compatible",
+        openai_compatible_api_key="zen-secret",
+    ))
+
+    result = asyncio.run(provider.generate("system", "prompt"))
+
+    assert result.response == '{"findings":[]}'
 
 
 def test_openai_compatible_failure_does_not_fall_back_or_expose_key(monkeypatch):
