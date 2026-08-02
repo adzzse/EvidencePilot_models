@@ -21,6 +21,13 @@ from app.extraction import (
     extract_from_url,
 )
 from app.models import ExtractRequest, ExtractionBlock, GenerateResponse
+from app.generation import (
+    GeminiGenerationProvider,
+    GenerationConfigurationError,
+    GenerationInvalidResponseError,
+    GenerationUnavailableError,
+    OllamaGenerationProvider,
+)
 from app.settings import Settings
 
 
@@ -47,28 +54,131 @@ def test_health_degrades_without_taking_api_offline(client: TestClient, monkeypa
     async def unavailable(_):
         raise main.OllamaUnavailableError("offline")
 
-    monkeypatch.setattr(main, "check_ollama", unavailable)
+    monkeypatch.setattr(OllamaGenerationProvider, "health", unavailable)
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
 
 
+def test_health_with_gemini_requires_only_local_embedding(
+    client: TestClient, monkeypatch
+):
+    required_generation = []
+    settings = SETTINGS.model_copy(update={
+        "generation_provider": "gemini",
+        "gemini_api_key": "secret",
+    })
+    main.app.dependency_overrides[main.get_settings] = lambda: settings
+
+    async def local_health(_, require_generation=True):
+        required_generation.append(require_generation)
+        return {
+            "ok": True,
+            "model_available": False,
+            "embedding_model_available": True,
+        }
+
+    async def gemini_health(_):
+        return {
+            "ok": True,
+            "provider": "gemini",
+            "model": settings.gemini_model,
+        }
+
+    monkeypatch.setattr(main, "check_ollama", local_health)
+    monkeypatch.setattr(GeminiGenerationProvider, "health", gemini_health)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["generation_provider"] == "gemini"
+    assert response.json()["generation"] == {
+        "ok": True,
+        "provider": "gemini",
+        "model": settings.gemini_model,
+    }
+    assert required_generation == [False]
+
+
 def test_post_endpoints_require_api_key(client: TestClient):
     assert client.post("/ai/embeddings", json={"text": "claim"}).status_code == 401
 
 
-def test_generate_uses_configured_model(client: TestClient, monkeypatch):
-    async def generate(prompt, settings):
+def test_generate_accepts_system_and_returns_provider_metadata(
+    client: TestClient, monkeypatch
+):
+    async def generate(system, prompt, settings):
+        assert system == "Judge claim quality"
         assert prompt == "Review this"
         assert settings.ollama_model == SETTINGS.ollama_model
-        return GenerateResponse(model=settings.ollama_model, response="done", done=True)
+        return GenerateResponse(
+            provider="ollama",
+            model=settings.ollama_model,
+            response="done",
+            done=True,
+        )
 
     monkeypatch.setattr(main, "generate_text", generate)
-    response = client.post("/ai/generate", headers=HEADERS, json={"prompt": "Review this"})
+    response = client.post(
+        "/ai/generate",
+        headers=HEADERS,
+        json={"system": "Judge claim quality", "prompt": "Review this"},
+    )
 
     assert response.status_code == 200
-    assert response.json()["response"] == "done"
+    assert response.json() == {
+        "provider": "ollama",
+        "model": SETTINGS.ollama_model,
+        "response": "done",
+        "done": True,
+    }
+
+
+def test_generate_keeps_prompt_only_request_compatible(client: TestClient, monkeypatch):
+    async def generate(system, prompt, settings):
+        assert system == ""
+        return GenerateResponse(
+            provider="ollama",
+            model=settings.ollama_model,
+            response=prompt,
+            done=True,
+        )
+
+    monkeypatch.setattr(main, "generate_text", generate)
+
+    response = client.post(
+        "/ai/generate",
+        headers=HEADERS,
+        json={"prompt": "Review this"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "Review this"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        (GenerationConfigurationError("bad config"), 503),
+        (GenerationUnavailableError("offline"), 503),
+        (GenerationInvalidResponseError("malformed"), 502),
+    ],
+)
+def test_generation_errors_map_to_gateway_status(failure, expected_status, monkeypatch):
+    async def generate(*_):
+        raise failure
+
+    monkeypatch.setattr(main, "generate_text", generate)
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/ai/generate",
+            headers=HEADERS,
+            json={"prompt": "Review this"},
+        )
+
+    assert response.status_code == expected_status
 
 
 def test_single_and_batch_embeddings_preserve_order(client: TestClient, monkeypatch):
@@ -459,3 +569,17 @@ def test_settings_reads_mineru_command(monkeypatch):
 
     assert getattr(settings, "mineru_command", None) == "C:/tools/mineru.exe"
     assert settings.mineru_backend == "pipeline"
+
+
+def test_settings_reads_generation_provider_configuration(monkeypatch):
+    monkeypatch.setenv("GENERATION_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "secret")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.6-flash")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3.5:9b")
+
+    settings = Settings.from_env()
+
+    assert settings.generation_provider == "gemini"
+    assert settings.gemini_api_key == "secret"
+    assert settings.gemini_model == "gemini-3.6-flash"
+    assert settings.ollama_model == "qwen3.5:9b"

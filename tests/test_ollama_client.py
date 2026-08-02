@@ -1,7 +1,92 @@
 import asyncio
 
-from app.ollama_client import check_ollama, generate_embeddings
+import pytest
+
+from app.ollama_client import (
+    OllamaInvalidResponseError,
+    check_ollama,
+    generate_embeddings,
+    generate_text,
+)
 from app.settings import Settings
+
+
+def test_generation_sends_runtime_system_and_json_options(monkeypatch):
+    request = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"model": "qwen3.5:9b", "response": "{}", "done": True}
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, json):
+            request.update(url=url, json=json)
+            return Response()
+
+    monkeypatch.setattr("app.ollama_client.httpx.AsyncClient", Client)
+
+    result = asyncio.run(generate_text(
+        "Judge claim quality",
+        '{"claim":"A"}',
+        Settings(ollama_model="qwen3.5:9b"),
+    ))
+
+    assert result.provider == "ollama"
+    assert request["url"].endswith("/api/generate")
+    assert request["json"] == {
+        "model": "qwen3.5:9b",
+        "system": "Judge claim quality",
+        "prompt": '{"claim":"A"}',
+        "format": "json",
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": 0,
+            "top_p": 0.9,
+            "repeat_penalty": 1.05,
+            "num_ctx": 262144,
+        },
+    }
+
+
+@pytest.mark.parametrize("model", [123, ""])
+def test_generation_rejects_malformed_ollama_metadata(monkeypatch, model):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"model": model, "response": "{}", "done": True}
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr("app.ollama_client.httpx.AsyncClient", Client)
+
+    with pytest.raises(OllamaInvalidResponseError):
+        asyncio.run(generate_text("system", "prompt", Settings()))
 
 
 def test_batch_embeddings_use_ollama_embed_api(monkeypatch):
@@ -44,7 +129,7 @@ def test_health_degrades_when_a_required_model_is_missing(monkeypatch):
             return None
 
         def json(self):
-            return {"models": [{"name": "evidencopilot:latest"}]}
+            return {"models": [{"name": "qwen3.5:9b"}]}
 
     class Client:
         def __init__(self, **_):

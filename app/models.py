@@ -46,7 +46,13 @@ class ExtractionManifest(BaseModel):
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    system: str = Field(default="", max_length=8000)
     prompt: str = Field(min_length=1, max_length=12000)
+
+    @field_validator("system")
+    @classmethod
+    def strip_system(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("prompt")
     @classmethod
@@ -58,7 +64,8 @@ class GenerateRequest(BaseModel):
 
 
 class GenerateResponse(BaseModel):
-    model: str
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
     response: str = Field(min_length=1)
     done: bool
 

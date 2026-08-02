@@ -13,6 +13,13 @@ from app.extraction import (
     ExtractionUnavailableError,
     create_extraction_bundle,
 )
+from app.generation import (
+    GenerationConfigurationError,
+    GenerationInvalidResponseError,
+    GenerationUnavailableError,
+    generate_text,
+    select_generation_provider,
+)
 from app.models import (
     BatchEmbeddingRequest,
     BatchEmbeddingResponse,
@@ -27,7 +34,6 @@ from app.ollama_client import (
     OllamaUnavailableError,
     check_ollama,
     generate_embeddings,
-    generate_text,
 )
 from app.settings import Settings, load_settings
 
@@ -52,15 +58,44 @@ def require_api_key(
 
 @app.get("/health")
 async def health(settings: Settings = Depends(get_settings)) -> dict:
+    generation_provider = settings.generation_provider
     try:
-        ollama = await check_ollama(settings)
-    except (OllamaUnavailableError, OllamaInvalidResponseError) as exc:
-        ollama = {"ok": False, "error": str(exc)}
+        provider = select_generation_provider(settings)
+        generation_provider = provider.name
+        try:
+            generation = await provider.health()
+        except (
+            GenerationUnavailableError,
+            GenerationInvalidResponseError,
+            OllamaUnavailableError,
+            OllamaInvalidResponseError,
+        ) as exc:
+            generation = {
+                "ok": False,
+                "provider": generation_provider,
+                "error": str(exc),
+            }
+    except GenerationConfigurationError as exc:
+        generation = {
+            "ok": False,
+            "provider": generation_provider,
+            "error": str(exc),
+        }
+
+    if generation_provider == "ollama":
+        ollama = generation
+    else:
+        try:
+            ollama = await check_ollama(settings, require_generation=False)
+        except (OllamaUnavailableError, OllamaInvalidResponseError) as exc:
+            ollama = {"ok": False, "error": str(exc)}
     return {
-        "status": "ok" if ollama.get("ok") else "degraded",
+        "status": "ok" if generation.get("ok") and ollama.get("ok") else "degraded",
         "model": settings.ollama_model,
         "embedding_model": settings.ollama_embedding_model,
         "ollama": ollama,
+        "generation_provider": generation_provider,
+        "generation": generation,
     }
 
 
@@ -93,7 +128,7 @@ async def generate(
     payload: GenerateRequest,
     settings: Settings = Depends(get_settings),
 ) -> GenerateResponse:
-    return await generate_text(payload.prompt, settings)
+    return await generate_text(payload.system, payload.prompt, settings)
 
 
 @app.post("/ai/embeddings", response_model=EmbeddingResponse, dependencies=[Depends(require_api_key)])
@@ -124,10 +159,13 @@ async def extraction_error_handler(_, exc: ExtractionError):
 
 @app.exception_handler(ExtractionUnavailableError)
 @app.exception_handler(OllamaUnavailableError)
+@app.exception_handler(GenerationConfigurationError)
+@app.exception_handler(GenerationUnavailableError)
 async def unavailable_handler(_, exc: RuntimeError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(OllamaInvalidResponseError)
-async def invalid_upstream_handler(_, exc: OllamaInvalidResponseError):
+@app.exception_handler(GenerationInvalidResponseError)
+async def invalid_upstream_handler(_, exc: RuntimeError):
     return JSONResponse(status_code=502, content={"detail": str(exc)})

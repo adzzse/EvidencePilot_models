@@ -18,7 +18,10 @@ class OllamaInvalidResponseError(RuntimeError):
     pass
 
 
-async def check_ollama(settings: Settings) -> dict[str, Any]:
+async def check_ollama(
+    settings: Settings,
+    require_generation: bool = True,
+) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{settings.ollama_base_url}/api/tags")
@@ -35,18 +38,28 @@ async def check_ollama(settings: Settings) -> dict[str, Any]:
     model_available = _available(settings.ollama_model, names)
     embedding_model_available = _available(settings.ollama_embedding_model, names)
     return {
-        "ok": model_available and embedding_model_available,
+        "ok": embedding_model_available and (
+            model_available or not require_generation
+        ),
         "model_available": model_available,
         "embedding_model_available": embedding_model_available,
     }
 
 
-async def generate_text(prompt: str, settings: Settings) -> GenerateResponse:
+async def generate_text(system: str, prompt: str, settings: Settings) -> GenerateResponse:
     payload = {
         "model": settings.ollama_model,
+        "system": system,
         "prompt": prompt,
+        "format": "json",
         "stream": False,
         "think": False,
+        "options": {
+            "temperature": 0,
+            "top_p": 0.9,
+            "repeat_penalty": 1.05,
+            "num_ctx": 262144,
+        },
     }
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -54,6 +67,7 @@ async def generate_text(prompt: str, settings: Settings) -> GenerateResponse:
             response.raise_for_status()
         data = response.json()
         return GenerateResponse(
+            provider="ollama",
             model=data["model"],
             response=data["response"],
             done=data["done"],
