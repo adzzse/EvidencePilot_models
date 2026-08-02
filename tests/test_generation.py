@@ -13,21 +13,37 @@ from app.settings import Settings
 
 
 @pytest.mark.parametrize(
-    ("configured", "api_key", "expected"),
+    ("configured", "compatible_key", "gemini_key", "expected"),
     [
-        ("auto", "", "ollama"),
-        ("auto", "secret", "gemini"),
-        ("ollama", "secret", "ollama"),
-        ("gemini", "secret", "gemini"),
+        ("auto", "", "", "ollama"),
+        ("auto", "zen-secret", "", "openai_compatible"),
+        ("auto", "", "gemini-secret", "ollama"),
+        ("ollama", "zen-secret", "gemini-secret", "ollama"),
+        ("openai_compatible", "zen-secret", "", "openai_compatible"),
+        ("gemini", "", "gemini-secret", "gemini"),
     ],
 )
-def test_provider_selection_matrix(configured, api_key, expected):
+def test_provider_selection_matrix(
+    configured, compatible_key, gemini_key, expected
+):
     provider = select_generation_provider(Settings(
         generation_provider=configured,
-        gemini_api_key=api_key,
+        openai_compatible_api_key=compatible_key,
+        gemini_api_key=gemini_key,
     ))
 
     assert provider.name == expected
+
+
+def test_forced_openai_compatible_requires_api_key():
+    with pytest.raises(
+        GenerationConfigurationError,
+        match="OPENAI_COMPATIBLE_API_KEY",
+    ):
+        select_generation_provider(Settings(
+            generation_provider="openai_compatible",
+            openai_compatible_api_key="",
+        ))
 
 
 def test_forced_gemini_requires_api_key():
@@ -36,6 +52,169 @@ def test_forced_gemini_requires_api_key():
             generation_provider="gemini",
             gemini_api_key="",
         ))
+
+
+def test_openai_compatible_generation_uses_chat_completions(monkeypatch):
+    request = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "model": "deepseek-v4-flash-free",
+                "choices": [{"message": {"content": '{"quality":"GOOD"}'}}],
+            }
+
+    class Client:
+        def __init__(self, **kwargs):
+            request["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, headers, json):
+            request.update(url=url, headers=headers, json=json)
+            return Response()
+
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    provider = select_generation_provider(Settings(
+        generation_provider="openai_compatible",
+        openai_compatible_api_key="zen-secret",
+    ))
+
+    result = asyncio.run(provider.generate("Judge claim quality", '{"claim":"A"}'))
+
+    assert result.provider == "openai_compatible"
+    assert result.model == "deepseek-v4-flash-free"
+    assert result.response == '{"quality":"GOOD"}'
+    assert request == {
+        "client": {"timeout": 120.0},
+        "url": "https://opencode.ai/zen/v1/chat/completions",
+        "headers": {"Authorization": "Bearer zen-secret"},
+        "json": {
+            "model": "deepseek-v4-flash-free",
+            "messages": [
+                {"role": "system", "content": "Judge claim quality"},
+                {"role": "user", "content": '{"claim":"A"}'},
+            ],
+            "max_tokens": 8192,
+            "stream": False,
+        },
+    }
+
+
+def test_openai_compatible_rejects_malformed_response(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": []}
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    provider = select_generation_provider(Settings(
+        generation_provider="openai_compatible",
+        openai_compatible_api_key="zen-secret",
+    ))
+
+    with pytest.raises(GenerationInvalidResponseError):
+        asyncio.run(provider.generate("system", "prompt"))
+
+
+def test_openai_compatible_failure_does_not_fall_back_or_expose_key(monkeypatch):
+    local_called = False
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            raise httpx.ConnectError("offline")
+
+    async def local_generation(*_):
+        nonlocal local_called
+        local_called = True
+
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    monkeypatch.setattr("app.generation.generate_with_ollama", local_generation)
+    provider = select_generation_provider(Settings(
+        generation_provider="auto",
+        openai_compatible_api_key="zen-secret",
+    ))
+
+    with pytest.raises(GenerationUnavailableError) as failure:
+        asyncio.run(provider.generate("system", "prompt"))
+
+    assert local_called is False
+    assert "zen-secret" not in str(failure.value)
+
+
+def test_openai_compatible_health_checks_configured_model(monkeypatch):
+    request = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "deepseek-v4-flash-free"}]}
+
+    class Client:
+        def __init__(self, **kwargs):
+            request["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def get(self, url, headers):
+            request.update(url=url, headers=headers)
+            return Response()
+
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    provider = select_generation_provider(Settings(
+        generation_provider="openai_compatible",
+        openai_compatible_api_key="zen-secret",
+    ))
+
+    result = asyncio.run(provider.health())
+
+    assert result == {
+        "ok": True,
+        "provider": "openai_compatible",
+        "model": "deepseek-v4-flash-free",
+    }
+    assert request == {
+        "client": {"timeout": 5.0},
+        "url": "https://opencode.ai/zen/v1/models",
+        "headers": {"Authorization": "Bearer zen-secret"},
+    }
 
 
 def test_gemini_generation_uses_official_rest_contract(monkeypatch):
@@ -123,7 +302,7 @@ def test_gemini_failure_does_not_fall_back_or_expose_key(monkeypatch):
     monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
     monkeypatch.setattr("app.generation.generate_with_ollama", local_generation)
     provider = select_generation_provider(Settings(
-        generation_provider="auto",
+        generation_provider="gemini",
         gemini_api_key="very-secret-key",
     ))
 
