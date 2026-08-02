@@ -7,6 +7,9 @@ from pydantic import BaseModel
 
 class Settings(BaseModel):
     generation_provider: str = "auto"
+    openai_compatible_api_key: str = ""
+    openai_compatible_base_url: str = "https://opencode.ai/zen/v1"
+    openai_compatible_model: str = "deepseek-v4-flash-free"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.6-flash"
     ollama_base_url: str = "http://127.0.0.1:11434"
@@ -29,6 +32,17 @@ class Settings(BaseModel):
         )
         return cls(
             generation_provider=os.getenv("GENERATION_PROVIDER", "auto").strip().lower(),
+            openai_compatible_api_key=os.getenv(
+                "OPENAI_COMPATIBLE_API_KEY", ""
+            ).strip(),
+            openai_compatible_base_url=os.getenv(
+                "OPENAI_COMPATIBLE_BASE_URL",
+                "https://opencode.ai/zen/v1",
+            ).rstrip("/"),
+            openai_compatible_model=os.getenv(
+                "OPENAI_COMPATIBLE_MODEL",
+                "deepseek-v4-flash-free",
+            ).strip(),
             gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip(),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),

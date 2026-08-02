@@ -45,6 +45,89 @@ class OllamaGenerationProvider:
         }
 
 
+class OpenAICompatibleGenerationProvider:
+    name = "openai_compatible"
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.settings.openai_compatible_api_key}"
+        }
+
+    async def generate(self, system: str, prompt: str) -> GenerateResponse:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        payload = {
+            "model": self.settings.openai_compatible_model,
+            "messages": messages,
+            "max_tokens": 8192,
+            "stream": False,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f"{self.settings.openai_compatible_base_url}/chat/completions",
+                    headers=self.headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+            data = response.json()
+            text = data["choices"][0]["message"]["content"]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("missing generated text")
+            returned_model = data.get("model")
+            if returned_model is not None and not isinstance(returned_model, str):
+                raise TypeError("invalid model")
+            return GenerateResponse(
+                provider=self.name,
+                model=returned_model or self.settings.openai_compatible_model,
+                response=text.strip(),
+                done=True,
+            )
+        except httpx.HTTPError as exc:
+            raise GenerationUnavailableError(
+                "OpenAI-compatible generation failed"
+            ) from exc
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise GenerationInvalidResponseError(
+                "OpenAI-compatible provider returned an invalid generation response"
+            ) from exc
+
+    async def health(self) -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    f"{self.settings.openai_compatible_base_url}/models",
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+            models = response.json()["data"]
+            if not isinstance(models, list) or not any(
+                isinstance(model, dict)
+                and model.get("id") == self.settings.openai_compatible_model
+                for model in models
+            ):
+                raise ValueError("configured model is unavailable")
+            return {
+                "ok": True,
+                "provider": self.name,
+                "model": self.settings.openai_compatible_model,
+            }
+        except httpx.HTTPError as exc:
+            raise GenerationUnavailableError(
+                "OpenAI-compatible health check failed"
+            ) from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GenerationInvalidResponseError(
+                "OpenAI-compatible provider returned an invalid model response"
+            ) from exc
+
+
 class GeminiGenerationProvider:
     name = "gemini"
     base_url = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -126,10 +209,19 @@ class GeminiGenerationProvider:
 def select_generation_provider(settings: Settings) -> GenerationProvider:
     configured = settings.generation_provider
     selected = (
-        "gemini" if settings.gemini_api_key else "ollama"
+        "openai_compatible"
+        if settings.openai_compatible_api_key
+        else "ollama"
     ) if configured == "auto" else configured
     if selected == "ollama":
         return OllamaGenerationProvider(settings)
+    if selected == "openai_compatible":
+        if not settings.openai_compatible_api_key:
+            raise GenerationConfigurationError(
+                "OPENAI_COMPATIBLE_API_KEY is required when "
+                "GENERATION_PROVIDER=openai_compatible"
+            )
+        return OpenAICompatibleGenerationProvider(settings)
     if selected == "gemini":
         if not settings.gemini_api_key:
             raise GenerationConfigurationError(
@@ -137,7 +229,8 @@ def select_generation_provider(settings: Settings) -> GenerationProvider:
             )
         return GeminiGenerationProvider(settings)
     raise GenerationConfigurationError(
-        "GENERATION_PROVIDER must be auto, ollama, or gemini"
+        "GENERATION_PROVIDER must be auto, ollama, gemini, or "
+        "openai_compatible"
     )
 
 

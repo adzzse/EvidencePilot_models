@@ -572,14 +572,23 @@ def test_settings_reads_mineru_command(monkeypatch):
 
 
 def test_settings_reads_generation_provider_configuration(monkeypatch):
-    monkeypatch.setenv("GENERATION_PROVIDER", "gemini")
-    monkeypatch.setenv("GEMINI_API_KEY", "secret")
+    monkeypatch.setenv("GENERATION_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "zen-secret")
+    monkeypatch.setenv(
+        "OPENAI_COMPATIBLE_BASE_URL",
+        "https://gateway.test/v1/",
+    )
+    monkeypatch.setenv("OPENAI_COMPATIBLE_MODEL", "deepseek-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
     monkeypatch.setenv("GEMINI_MODEL", "gemini-3.6-flash")
     monkeypatch.setenv("OLLAMA_MODEL", "qwen3.5:9b")
 
     settings = Settings.from_env()
 
-    assert settings.generation_provider == "gemini"
-    assert settings.gemini_api_key == "secret"
+    assert settings.generation_provider == "openai_compatible"
+    assert settings.openai_compatible_api_key == "zen-secret"
+    assert settings.openai_compatible_base_url == "https://gateway.test/v1"
+    assert settings.openai_compatible_model == "deepseek-test"
+    assert settings.gemini_api_key == "gemini-secret"
     assert settings.gemini_model == "gemini-3.6-flash"
     assert settings.ollama_model == "qwen3.5:9b"

@@ -6,7 +6,7 @@ Qdrant, or application database access.
 - PDF extraction: MinerU (`mineru` CLI)
 - DOCX extraction: `python-docx`, normalized to Markdown and structured blocks
 - Markdown extraction: direct UTF-8 normalization to structured blocks
-- Text generation: Gemini API or local Ollama
+- Text generation: OpenAI-compatible API, Gemini API, or local Ollama
 - Single and batch embeddings: Ollama `nomic-embed-text`
 
 Java remains responsible for upload state, queue consumption, Markdown/chunk
@@ -41,19 +41,25 @@ Generation provider configuration:
 
 ```dotenv
 GENERATION_PROVIDER=auto
+OPENAI_COMPATIBLE_API_KEY=
+OPENAI_COMPATIBLE_BASE_URL=https://opencode.ai/zen/v1
+OPENAI_COMPATIBLE_MODEL=deepseek-v4-flash-free
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.6-flash
 OLLAMA_MODEL=qwen3.5:9b
 ```
 
-With `auto`, a non-empty `GEMINI_API_KEY` selects Gemini; otherwise generation
-uses local Ollama. Set `GENERATION_PROVIDER=ollama` to force local generation
-even when a Gemini key exists. Set it to `gemini` to require Gemini; a missing
-key is then a configuration error. Once Gemini is selected, an API failure is
-returned to the caller and is not silently retried through Ollama. Embeddings
-and document extraction always remain local. Generation context, including
-Claims, source chunks, paper sections, and feedback, is sent to Gemini when it
-is selected.
+With `auto`, a non-empty `OPENAI_COMPATIBLE_API_KEY` selects the compatible
+provider; otherwise generation uses local Ollama. Gemini is selected only with
+`GENERATION_PROVIDER=gemini`, which requires `GEMINI_API_KEY`. Set the provider
+to `ollama` to force local generation or `openai_compatible` to require the
+compatible API key. Once a provider is selected, an upstream failure is
+returned to the caller without failover. Embeddings and document extraction
+always remain local. Generation context, including Claims, source chunks,
+paper sections, and feedback, is sent to the selected remote provider.
+
+OpenCode's free DeepSeek V4 Flash endpoint may retain and use submitted data
+for model improvement. Do not send personal or confidential data through it.
 
 Set `MODEL_API_KEY` to the same value as Java's `AI_MODEL_API_KEY`. Set
 `EXTRACTION_ALLOWED_HOSTS` to the hostname used by Java's presigned MinIO URLs;
@@ -62,7 +68,7 @@ hostname must be reachable from this machine, so a Railway-private hostname is
 not suitable for the presigned download URL.
 
 `MODEL_API_KEY` authenticates Java requests to this worker. It is unrelated to
-Google's `GEMINI_API_KEY`.
+`OPENAI_COMPATIBLE_API_KEY` or Google's `GEMINI_API_KEY`.
 
 ## Run
 
