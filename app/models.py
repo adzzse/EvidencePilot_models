@@ -47,7 +47,7 @@ class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     system: str = Field(default="", max_length=8000)
-    prompt: str = Field(min_length=1, max_length=12000)
+    prompt: str = Field(min_length=1, max_length=48000)
 
     @field_validator("system")
     @classmethod

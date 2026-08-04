@@ -16,6 +16,7 @@ from app.extraction import (
 from app.generation import (
     GenerationConfigurationError,
     GenerationInvalidResponseError,
+    GenerationRateLimitError,
     GenerationUnavailableError,
     generate_text,
     select_generation_provider,
@@ -163,6 +164,11 @@ async def extraction_error_handler(_, exc: ExtractionError):
 @app.exception_handler(GenerationUnavailableError)
 async def unavailable_handler(_, exc: RuntimeError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@app.exception_handler(GenerationRateLimitError)
+async def rate_limit_handler(_, exc: GenerationRateLimitError):
+    return JSONResponse(status_code=429, content={"detail": str(exc)})
 
 
 @app.exception_handler(OllamaInvalidResponseError)

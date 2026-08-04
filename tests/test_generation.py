@@ -6,6 +6,7 @@ import pytest
 from app.generation import (
     GenerationConfigurationError,
     GenerationInvalidResponseError,
+    GenerationRateLimitError,
     GenerationUnavailableError,
     select_generation_provider,
 )
@@ -175,6 +176,33 @@ def test_openai_compatible_retries_malformed_response_once(monkeypatch):
     result = asyncio.run(provider.generate("system", "prompt"))
 
     assert result.response == '{"findings":[]}'
+
+
+def test_openai_compatible_preserves_rate_limit(monkeypatch):
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return httpx.Response(
+                429,
+                request=httpx.Request("POST", "https://opencode.ai/zen/v1/chat/completions"),
+            )
+
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    provider = select_generation_provider(Settings(
+        generation_provider="openai_compatible",
+        openai_compatible_api_key="zen-secret",
+    ))
+
+    with pytest.raises(GenerationRateLimitError, match="rate limit"):
+        asyncio.run(provider.generate("system", "prompt"))
 
 
 def test_openai_compatible_failure_does_not_fall_back_or_expose_key(monkeypatch):

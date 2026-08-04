@@ -25,6 +25,7 @@ from app.generation import (
     GeminiGenerationProvider,
     GenerationConfigurationError,
     GenerationInvalidResponseError,
+    GenerationRateLimitError,
     GenerationUnavailableError,
     OllamaGenerationProvider,
 )
@@ -158,11 +159,39 @@ def test_generate_keeps_prompt_only_request_compatible(client: TestClient, monke
     assert response.json()["response"] == "Review this"
 
 
+def test_generate_accepts_whole_paper_prompt(client: TestClient, monkeypatch):
+    async def generate(_system, prompt, settings):
+        return GenerateResponse(
+            provider="ollama",
+            model=settings.ollama_model,
+            response=str(len(prompt)),
+            done=True,
+        )
+
+    monkeypatch.setattr(main, "generate_text", generate)
+
+    accepted = client.post(
+        "/ai/generate",
+        headers=HEADERS,
+        json={"prompt": "x" * 48000},
+    )
+    rejected = client.post(
+        "/ai/generate",
+        headers=HEADERS,
+        json={"prompt": "x" * 48001},
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["response"] == "48000"
+    assert rejected.status_code == 422
+
+
 @pytest.mark.parametrize(
     ("failure", "expected_status"),
     [
         (GenerationConfigurationError("bad config"), 503),
         (GenerationUnavailableError("offline"), 503),
+        (GenerationRateLimitError("rate limited"), 429),
         (GenerationInvalidResponseError("malformed"), 502),
     ],
 )

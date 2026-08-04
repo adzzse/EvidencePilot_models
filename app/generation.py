@@ -15,6 +15,10 @@ class GenerationUnavailableError(RuntimeError):
     pass
 
 
+class GenerationRateLimitError(RuntimeError):
+    pass
+
+
 class GenerationInvalidResponseError(RuntimeError):
     pass
 
@@ -99,6 +103,14 @@ class OpenAICompatibleGenerationProvider:
                     except (KeyError, IndexError, TypeError, ValueError):
                         if attempt == 1:
                             raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                raise GenerationRateLimitError(
+                    "OpenAI-compatible provider rate limit exceeded"
+                ) from exc
+            raise GenerationUnavailableError(
+                "OpenAI-compatible generation failed"
+            ) from exc
         except httpx.HTTPError as exc:
             raise GenerationUnavailableError(
                 "OpenAI-compatible generation failed"
