@@ -116,6 +116,7 @@ def test_openai_compatible_rejects_malformed_response_once(monkeypatch, caplog):
     class Response:
         status_code = 200
         headers = {"content-type": "application/json"}
+        text = '{"unexpected":"raw-provider-body"}'
 
         def raise_for_status(self):
             return None
@@ -150,6 +151,7 @@ def test_openai_compatible_rejects_malformed_response_once(monkeypatch, caplog):
 
     assert calls == 1
     assert "Invalid provider response: IndexError" in caplog.text
+    assert '{"unexpected":"raw-provider-body"}' in caplog.text
 
 
 def test_openai_compatible_preserves_rate_limit(monkeypatch):

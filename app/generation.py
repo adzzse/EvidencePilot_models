@@ -105,11 +105,12 @@ class OpenAICompatibleGenerationProvider:
                     )
                 except (KeyError, IndexError, TypeError, ValueError) as exc:
                     logger.warning(
-                        "Invalid provider response: %s: %s (status=%s, content-type=%s)",
+                        "Invalid provider response: %s: %s (status=%s, content-type=%s, raw-body=%r)",
                         type(exc).__name__,
                         exc,
                         response.status_code,
                         response.headers.get("content-type"),
+                        response.text,
                     )
                     raise
         except httpx.HTTPStatusError as exc:
