@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Protocol
 
 import httpx
@@ -5,6 +6,9 @@ import httpx
 from app.models import GenerateResponse
 from app.ollama_client import check_ollama, generate_text as generate_with_ollama
 from app.settings import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class GenerationConfigurationError(RuntimeError):
@@ -76,48 +80,53 @@ class OpenAICompatibleGenerationProvider:
             payload["thinking"] = {"type": "disabled"}
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                for attempt in range(2):
-                    response = await client.post(
-                        f"{self.settings.openai_compatible_base_url}/chat/completions",
-                        headers=self.headers,
-                        json=payload,
+                response = await client.post(
+                    f"{self.settings.openai_compatible_base_url}/chat/completions",
+                    headers=self.headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                try:
+                    data = response.json()
+                    text = data["choices"][0]["message"]["content"]
+                    if not isinstance(text, str) or not text.strip():
+                        raise ValueError("missing generated text")
+                    returned_model = data.get("model")
+                    if returned_model is not None and not isinstance(
+                        returned_model, str
+                    ):
+                        raise TypeError("invalid model")
+                    return GenerateResponse(
+                        provider=self.name,
+                        model=returned_model
+                        or self.settings.openai_compatible_model,
+                        response=text.strip(),
+                        done=True,
                     )
-                    response.raise_for_status()
-                    try:
-                        data = response.json()
-                        text = data["choices"][0]["message"]["content"]
-                        if not isinstance(text, str) or not text.strip():
-                            raise ValueError("missing generated text")
-                        returned_model = data.get("model")
-                        if returned_model is not None and not isinstance(
-                            returned_model, str
-                        ):
-                            raise TypeError("invalid model")
-                        return GenerateResponse(
-                            provider=self.name,
-                            model=returned_model
-                            or self.settings.openai_compatible_model,
-                            response=text.strip(),
-                            done=True,
-                        )
-                    except (KeyError, IndexError, TypeError, ValueError):
-                        if attempt == 1:
-                            raise
+                except (KeyError, IndexError, TypeError, ValueError) as exc:
+                    logger.warning(
+                        "Invalid provider response: %s: %s (status=%s, content-type=%s)",
+                        type(exc).__name__,
+                        exc,
+                        response.status_code,
+                        response.headers.get("content-type"),
+                    )
+                    raise
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 raise GenerationRateLimitError(
-                    "OpenAI-compatible provider rate limit exceeded"
+                    "Provider rate limit exceeded"
                 ) from exc
             raise GenerationUnavailableError(
-                "OpenAI-compatible generation failed"
+                "Generation failed"
             ) from exc
         except httpx.HTTPError as exc:
             raise GenerationUnavailableError(
-                "OpenAI-compatible generation failed"
+                "Generation failed"
             ) from exc
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise GenerationInvalidResponseError(
-                "OpenAI-compatible provider returned an invalid generation response"
+                "Provider returned an invalid generation response"
             ) from exc
 
     async def health(self) -> dict[str, Any]:
@@ -142,11 +151,11 @@ class OpenAICompatibleGenerationProvider:
             }
         except httpx.HTTPError as exc:
             raise GenerationUnavailableError(
-                "OpenAI-compatible health check failed"
+                "Health check failed"
             ) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise GenerationInvalidResponseError(
-                "OpenAI-compatible provider returned an invalid model response"
+                "Provider returned an invalid model response"
             ) from exc
 
 
@@ -224,7 +233,7 @@ class GeminiGenerationProvider:
             raise GenerationUnavailableError("Gemini health check failed") from exc
         except (AttributeError, TypeError, ValueError) as exc:
             raise GenerationInvalidResponseError(
-                "Gemini returned an invalid model response"
+                "Invalid model response"
             ) from exc
 
 
