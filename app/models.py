@@ -104,3 +104,44 @@ class BatchEmbeddingRequest(BaseModel):
 
 class BatchEmbeddingResponse(BaseModel):
     embeddings: list[list[float]]
+
+
+class EvaluationCriterion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1)
+    weight: float = Field(ge=0.0, le=1.0)
+
+
+class AuditFlags(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requires_citation_check: bool = False
+
+
+class SectionContextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    section_name: str = Field(min_length=1, max_length=255)
+    current_context: str = Field(min_length=1)
+    source_chunk: str = Field(min_length=1)
+    evaluation_criteria: list[EvaluationCriterion] = Field(min_length=1)
+    flags: AuditFlags
+
+
+class AuditedSnippet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    original_text_snippet: str = Field(min_length=1)
+    start_index: int = Field(ge=0)
+    end_index: int = Field(ge=1)
+    issue_type: str = Field(min_length=1, max_length=100)
+    rationale: str = Field(min_length=1)
+    suggested_paraphrase: str | None = Field(default=None)
+
+
+class SectionContextResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snippets: list[AuditedSnippet] = Field(default_factory=list)
