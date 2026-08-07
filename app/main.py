@@ -8,7 +8,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
-from app.audit import audit_section
 from app.extraction import (
     ExtractionError,
     ExtractionUnavailableError,
@@ -30,8 +29,6 @@ from app.models import (
     ExtractRequest,
     GenerateRequest,
     GenerateResponse,
-    SectionContextRequest,
-    SectionContextResponse,
 )
 from app.ollama_client import (
     OllamaInvalidResponseError,
@@ -133,18 +130,6 @@ async def generate(
     settings: Settings = Depends(get_settings),
 ) -> GenerateResponse:
     return await generate_text(payload.system, payload.prompt, settings)
-
-
-@app.post(
-    "/audit/section",
-    response_model=SectionContextResponse,
-    dependencies=[Depends(require_api_key)],
-)
-async def audit(
-    payload: SectionContextRequest,
-    settings: Settings = Depends(get_settings),
-) -> SectionContextResponse:
-    return await audit_section(payload, settings)
 
 
 @app.post("/ai/embeddings", response_model=EmbeddingResponse, dependencies=[Depends(require_api_key)])
