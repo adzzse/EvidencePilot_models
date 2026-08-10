@@ -104,6 +104,7 @@ def test_openai_compatible_generation_uses_chat_completions(monkeypatch):
                 {"role": "user", "content": '{"claim":"A"}'},
             ],
             "max_tokens": 8192,
+            "temperature": 0,
             "stream": False,
             "thinking": {"type": "disabled"},
         },
