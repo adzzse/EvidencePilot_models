@@ -75,6 +75,7 @@ class OpenAICompatibleGenerationProvider:
             "messages": messages,
             "max_tokens": 8192,
             "temperature": 0,
+            "response_format": {"type": "json_object"},
             "stream": False,
         }
         if self.settings.openai_compatible_model.startswith("deepseek-v4"):

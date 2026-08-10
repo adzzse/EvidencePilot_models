@@ -105,6 +105,7 @@ def test_openai_compatible_generation_uses_chat_completions(monkeypatch):
             ],
             "max_tokens": 8192,
             "temperature": 0,
+            "response_format": {"type": "json_object"},
             "stream": False,
             "thinking": {"type": "disabled"},
         },
