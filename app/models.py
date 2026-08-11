@@ -18,14 +18,23 @@ class ExtractionBlock(BaseModel):
         "paragraph",
         "list",
         "table",
+        "figure",
         "figure_caption",
         "equation",
         "code",
         "reference",
+        "header",
+        "footer",
+        "page_number",
+        "page_footnote",
     ]
     text: str = Field(min_length=1)
     level: int | None = Field(default=None, ge=1, le=6)
     caption: str | None = Field(default=None, min_length=1)
+    source_type: str | None = Field(default=None, serialization_alias="sourceType")
+    page_index: int | None = Field(default=None, ge=0, serialization_alias="pageIndex")
+    bbox: tuple[float, float, float, float] | None = None
+    asset_path: str | None = Field(default=None, min_length=1, serialization_alias="assetPath")
 
     @model_validator(mode="after")
     def validate_level(self):
@@ -35,12 +44,28 @@ class ExtractionBlock(BaseModel):
             raise ValueError("level is only valid for heading blocks")
         return self
 
+    @field_validator("bbox")
+    @classmethod
+    def validate_bbox(cls, value: tuple[float, float, float, float] | None):
+        if value is not None and (value[2] <= value[0] or value[3] <= value[1]):
+            raise ValueError("bbox must have positive width and height")
+        return value
+
+
+class ExtractionPage(BaseModel):
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    page_index: int = Field(ge=0, serialization_alias="pageIndex")
+    width: float = Field(gt=0)
+    height: float = Field(gt=0)
+
 
 class ExtractionManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     blocks: list[ExtractionBlock] = Field(min_length=1)
     images: list[str] = Field(default_factory=list)
+    pages: list[ExtractionPage] = Field(default_factory=list)
 
 
 class GenerateRequest(BaseModel):

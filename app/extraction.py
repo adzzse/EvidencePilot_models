@@ -17,7 +17,7 @@ from docx import Document as load_docx
 from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
 
-from app.models import ExtractionManifest, ExtractRequest
+from app.models import ExtractionManifest, ExtractionPage, ExtractRequest
 from app.settings import Settings
 
 
@@ -47,6 +47,10 @@ class ExtractionBlock:
     text: str
     level: int | None = None
     caption: str | None = None
+    source_type: str | None = None
+    page_index: int | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    asset_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ class ExtractedDocument:
     markdown: str
     blocks: tuple[ExtractionBlock, ...]
     images: tuple[str, ...] = ()
+    pages: tuple[ExtractionPage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,9 +127,10 @@ def _write_extraction_bundle(
     manifest = ExtractionManifest(
         blocks=list(product.document.blocks),
         images=list(product.document.images),
+        pages=list(product.document.pages),
     )
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("extraction.json", manifest.model_dump_json())
+        archive.writestr("extraction.json", manifest.model_dump_json(by_alias=True))
         archive.writestr("document.md", product.document.markdown)
         for archive_path, source_path in product.image_files:
             archive.write(source_path, archive_path)
@@ -230,6 +236,7 @@ def _read_mineru_output(output_dir: Path, document_stem: str) -> ExtractionWorkP
         _clean(markdown_path.read_text(encoding="utf-8")),
         blocks,
         tuple(path for path, _ in image_files),
+        tuple(_infer_pages(content_list)),
     )
     return ExtractionWorkProduct(document, image_files)
 
@@ -291,37 +298,117 @@ def _normalize_mineru_blocks(content_list: list[dict[str, Any]]) -> list[Extract
             if is_reference_heading:
                 reference_level = level
             if text:
-                blocks.append(ExtractionBlock(
+                blocks.append(_mineru_block(
                     "reference" if reference_level is not None else "heading",
                     text,
-                    None if reference_level is not None else level,
+                    item,
+                    level=None if reference_level is not None else level,
                 ))
             continue
 
-        is_reference = reference_level is not None or item.get("sub_type") == "ref_text"
+        is_reference = item_type in {"text", "list"} and (
+            reference_level is not None or item.get("sub_type") == "ref_text")
         if is_reference:
             if text:
-                blocks.append(ExtractionBlock("reference", text))
+                blocks.append(_mineru_block("reference", text, item))
             continue
 
         if item_type == "text" and text:
-            blocks.append(ExtractionBlock("paragraph", text))
+            blocks.append(_mineru_block("paragraph", text, item))
         elif item_type == "list" and text:
-            blocks.append(ExtractionBlock("list", text))
+            blocks.append(_mineru_block("list", text, item))
         elif item_type == "table":
             table = _table_to_markdown(str(item.get("table_body", "")))
             if table:
-                blocks.append(ExtractionBlock("table", table, caption=_caption(item, "table_caption")))
-        elif item_type in {"image", "figure"}:
+                blocks.append(_mineru_block(
+                    "table", table, item, caption=_caption(item, "table_caption")))
+        elif item_type in {"image", "figure", "chart"}:
             caption = _caption(item, "image_caption")
-            if caption:
-                blocks.append(ExtractionBlock("figure_caption", caption))
+            asset_path = item.get("img_path")
+            asset_path = asset_path if isinstance(asset_path, str) and asset_path else None
+            if caption or asset_path:
+                blocks.append(_mineru_block(
+                    "figure",
+                    caption or asset_path or "Figure",
+                    item,
+                    caption=caption,
+                    asset_path=asset_path,
+                ))
         elif item_type in {"equation", "interline_equation"} and text:
-            blocks.append(ExtractionBlock("equation", text))
+            blocks.append(_mineru_block("equation", text, item))
         elif item_type == "code" and text:
-            blocks.append(ExtractionBlock("code", text, caption=_caption(item, "code_caption")))
+            blocks.append(_mineru_block(
+                "code", text, item, caption=_caption(item, "code_caption")))
+        elif item_type in {"header", "footer", "page_number", "page_footnote"} and text:
+            blocks.append(_mineru_block(item_type, text, item))
 
     return blocks
+
+
+def _mineru_block(
+    block_type: str,
+    text: str,
+    item: dict[str, Any],
+    *,
+    level: int | None = None,
+    caption: str | None = None,
+    asset_path: str | None = None,
+) -> ExtractionBlock:
+    page_index = item.get("page_idx")
+    page_index = page_index if isinstance(page_index, int) and page_index >= 0 else None
+    return ExtractionBlock(
+        type=block_type,
+        text=text,
+        level=level,
+        caption=caption,
+        source_type=str(item.get("type", "")) or None,
+        page_index=page_index,
+        bbox=_bbox(item),
+        asset_path=asset_path,
+    )
+
+
+def _bbox(item: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    raw = item.get("bbox")
+    if not isinstance(raw, list) or len(raw) != 4:
+        return None
+    if any(not isinstance(value, (int, float)) for value in raw):
+        return None
+    bbox = tuple(float(value) for value in raw)
+    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        return None
+    return bbox
+
+
+def _infer_pages(content_list: list[dict[str, Any]]) -> list[ExtractionPage]:
+    bounds: dict[int, list[tuple[float, float, float, float]]] = {}
+    declared: dict[int, tuple[float, float]] = {}
+    for item in content_list:
+        if not isinstance(item, dict):
+            continue
+        page_index = item.get("page_idx")
+        if not isinstance(page_index, int) or page_index < 0:
+            continue
+        bbox = _bbox(item)
+        if bbox is not None:
+            bounds.setdefault(page_index, []).append(bbox)
+        size = item.get("page_size")
+        if (isinstance(size, list) and len(size) == 2
+                and all(isinstance(value, (int, float)) and value > 0 for value in size)):
+            declared[page_index] = (float(size[0]), float(size[1]))
+
+    pages: list[ExtractionPage] = []
+    for page_index in sorted(bounds.keys() | declared.keys()):
+        if page_index in declared:
+            width, height = declared[page_index]
+        else:
+            page_bounds = bounds[page_index]
+            min_x = min(box[0] for box in page_bounds)
+            min_y = min(box[1] for box in page_bounds)
+            width = max(box[2] for box in page_bounds) + max(0.0, min_x)
+            height = max(box[3] for box in page_bounds) + max(0.0, min_y)
+        pages.append(ExtractionPage(page_index=page_index, width=width, height=height))
+    return pages
 
 
 def _item_text(item: dict[str, Any]) -> str:

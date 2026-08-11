@@ -495,19 +495,38 @@ def test_mineru_reads_markdown_and_normalizes_blocks(tmp_path):
     markdown_path = output_dir / "input.md"
     markdown_path.parent.mkdir(parents=True)
     markdown_path.write_text("# Extracted", encoding="utf-8")
+    (output_dir / "images").mkdir()
+    (output_dir / "images" / "architecture.png").write_bytes(b"png")
     (output_dir / "input_content_list.json").write_text(
         json.dumps([
-            {"type": "text", "text": "Results", "text_level": 2},
-            {"type": "text", "text": "A result paragraph."},
+            {
+                "type": "text", "text": "Results", "text_level": 2,
+                "page_idx": 0, "page_size": [1000, 1400],
+                "bbox": [100, 120, 300, 150],
+            },
+            {
+                "type": "text", "text": "A result paragraph.",
+                "page_idx": 0, "bbox": [100, 180, 480, 240],
+            },
             {
                 "type": "table",
                 "table_caption": ["Table 1"],
+                "page_idx": 0,
+                "bbox": [100, 260, 900, 500],
                 "table_body": (
                     "<table><thead><tr><th>A</th><th>B</th></tr></thead>"
                     "<tbody><tr><td>1</td><td>2</td></tr></tbody></table>"
                 ),
             },
-            {"type": "image", "image_caption": ["Figure 1. Architecture"]},
+            {
+                "type": "chart", "image_caption": ["Figure 1. Architecture"],
+                "img_path": "images/architecture.png", "page_idx": 0,
+                "bbox": [520, 520, 900, 800],
+            },
+            {"type": "header", "text": "Running title", "page_idx": 0, "bbox": [100, 30, 300, 50]},
+            {"type": "footer", "text": "Journal 2026", "page_idx": 0, "bbox": [100, 1350, 300, 1370]},
+            {"type": "page_number", "text": "192", "page_idx": 0, "bbox": [900, 30, 930, 50]},
+            {"type": "page_footnote", "text": "Funding note", "page_idx": 0, "bbox": [100, 1280, 400, 1320]},
             {"type": "text", "text": "References", "text_level": 1},
             {"type": "list", "sub_type": "ref_text", "text": "Smith 2024"},
         ]),
@@ -523,12 +542,25 @@ def test_mineru_reads_markdown_and_normalizes_blocks(tmp_path):
         "heading",
         "paragraph",
         "table",
-        "figure_caption",
+        "figure",
+        "header",
+        "footer",
+        "page_number",
+        "page_footnote",
         "reference",
         "reference",
     ]
     assert result.document.blocks[2].caption == "Table 1"
     assert result.document.blocks[2].text == "| A | B |\n| --- | --- |\n| 1 | 2 |"
+    assert result.document.blocks[0].source_type == "text"
+    assert result.document.blocks[0].page_index == 0
+    assert result.document.blocks[0].bbox == (100.0, 120.0, 300.0, 150.0)
+    assert result.document.blocks[3].asset_path == "images/architecture.png"
+    assert result.document.pages[0].model_dump() == {
+        "page_index": 0,
+        "width": 1000.0,
+        "height": 1400.0,
+    }
 
 
 def test_mineru_bundle_includes_referenced_image(tmp_path):
