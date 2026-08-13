@@ -6,7 +6,7 @@ Qdrant, or application database access.
 - PDF extraction: MinerU (`mineru` CLI)
 - DOCX extraction: `python-docx`, normalized to Markdown and structured blocks
 - Markdown extraction: direct UTF-8 normalization to structured blocks
-- Text generation: OpenAI-compatible API, Gemini API, or local Ollama
+- Text generation: any OpenAI-compatible API or local Ollama
 - Single and batch embeddings: Ollama `nomic-embed-text`
 
 Java remains responsible for upload state, queue consumption, Markdown/chunk
@@ -37,29 +37,38 @@ ollama pull qwen3.5:9b
 ollama pull nomic-embed-text
 ```
 
-Generation provider configuration:
+Generation can use local Ollama or one remote OpenAI-compatible endpoint:
 
 ```dotenv
 GENERATION_PROVIDER=auto
-OPENAI_COMPATIBLE_API_KEY=
-OPENAI_COMPATIBLE_BASE_URL=https://opencode.ai/zen/v1
-OPENAI_COMPATIBLE_MODEL=deepseek-v4-flash-free
-GEMINI_API_KEY=
-GEMINI_MODEL=gemini-3.6-flash
+GENERATION_API_KEY=
+GENERATION_BASE_URL=https://openrouter.ai/api/v1
+GENERATION_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
+GENERATION_EXTRA_BODY={"reasoning":{"effort":"none"}}
 OLLAMA_MODEL=qwen3.5:9b
 ```
 
-With `auto`, a non-empty `OPENAI_COMPATIBLE_API_KEY` selects the compatible
-provider; otherwise generation uses local Ollama. Gemini is selected only with
-`GENERATION_PROVIDER=gemini`, which requires `GEMINI_API_KEY`. Set the provider
-to `ollama` to force local generation or `openai_compatible` to require the
-compatible API key. Once a provider is selected, an upstream failure is
-returned to the caller without failover. Embeddings and document extraction
-always remain local. Generation context, including Claims, source chunks,
-paper sections, and feedback, is sent to the selected remote provider.
+With `auto`, a non-empty `GENERATION_API_KEY` selects `remote`; otherwise
+generation uses local Ollama. Use `GENERATION_PROVIDER=remote` or `ollama` to
+force either path. Switching services only changes the generic remote values:
 
-OpenCode's free DeepSeek V4 Flash endpoint may retain and use submitted data
-for model improvement. Do not send personal or confidential data through it.
+| Service | `GENERATION_BASE_URL` | Example model | `GENERATION_EXTRA_BODY` |
+| --- | --- | --- | --- |
+| OpenRouter | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-ultra-550b-a55b:free` | `{"reasoning":{"effort":"none"}}` |
+| OpenCode Zen | `https://opencode.ai/zen/v1` | `deepseek-v4-flash-free` | `{"thinking":{"type":"disabled"}}` |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.6-flash` | `{"reasoning_effort":"minimal"}` |
+
+`GENERATION_EXTRA_BODY` defaults to `{}` and holds provider-specific compatible
+options. Gemini 3 models support reducing thinking to `minimal`, but do not
+support fully disabling it; Gemini 2.5 models that allow disabling thinking can
+use `{"reasoning_effort":"none"}`.
+
+Every remote request uses `temperature=0`, JSON-object output, and non-streaming
+mode. Once selected, an upstream failure is returned without failover.
+Embeddings and document extraction always remain local. Generation context,
+including Claims, source chunks, paper sections, and feedback, is sent to the
+selected remote service. Review that service's data policy and do not send
+personal or confidential data through a free endpoint.
 
 Set `MODEL_API_KEY` to the same value as Java's `AI_MODEL_API_KEY`. Set
 `EXTRACTION_ALLOWED_HOSTS` to the hostname used by Java's presigned MinIO URLs;
@@ -68,7 +77,7 @@ hostname must be reachable from this machine, so a Railway-private hostname is
 not suitable for the presigned download URL.
 
 `MODEL_API_KEY` authenticates Java requests to this worker. It is unrelated to
-`OPENAI_COMPATIBLE_API_KEY` or Google's `GEMINI_API_KEY`.
+`GENERATION_API_KEY`.
 
 ## Run
 
@@ -126,8 +135,8 @@ provider and actual model used:
 
 ```json
 {
-  "provider": "gemini",
-  "model": "gemini-3.6-flash",
+  "provider": "remote",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
   "response": "{\"supported\":true}",
   "done": true
 }

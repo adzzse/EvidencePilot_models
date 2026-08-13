@@ -1,17 +1,18 @@
+import json
 import os
 from functools import lru_cache
+from typing import Any
 
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Settings(BaseModel):
     generation_provider: str = "auto"
-    openai_compatible_api_key: str = ""
-    openai_compatible_base_url: str = "https://opencode.ai/zen/v1"
-    openai_compatible_model: str = "deepseek-v4-flash-free"
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.6-flash"
+    generation_api_key: str = ""
+    generation_base_url: str = ""
+    generation_model: str = ""
+    generation_extra_body: dict[str, Any] = Field(default_factory=dict)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:9b"
     ollama_embedding_model: str = "nomic-embed-text"
@@ -32,19 +33,14 @@ class Settings(BaseModel):
         )
         return cls(
             generation_provider=os.getenv("GENERATION_PROVIDER", "auto").strip().lower(),
-            openai_compatible_api_key=os.getenv(
-                "OPENAI_COMPATIBLE_API_KEY", ""
-            ).strip(),
-            openai_compatible_base_url=os.getenv(
-                "OPENAI_COMPATIBLE_BASE_URL",
-                "https://opencode.ai/zen/v1",
-            ).rstrip("/"),
-            openai_compatible_model=os.getenv(
-                "OPENAI_COMPATIBLE_MODEL",
-                "deepseek-v4-flash-free",
-            ).strip(),
-            gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip(),
+            generation_api_key=os.getenv("GENERATION_API_KEY", "").strip(),
+            generation_base_url=os.getenv("GENERATION_BASE_URL", "")
+            .strip()
+            .rstrip("/"),
+            generation_model=os.getenv("GENERATION_MODEL", "").strip(),
+            generation_extra_body=json.loads(
+                os.getenv("GENERATION_EXTRA_BODY", "{}") or "{}"
+            ),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:9b"),
             ollama_embedding_model=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),

@@ -22,12 +22,12 @@ from app.extraction import (
 )
 from app.models import ExtractRequest, ExtractionBlock, GenerateResponse
 from app.generation import (
-    GeminiGenerationProvider,
     GenerationConfigurationError,
     GenerationInvalidResponseError,
     GenerationRateLimitError,
     GenerationUnavailableError,
     OllamaGenerationProvider,
+    OpenAICompatibleGenerationProvider,
 )
 from app.settings import Settings
 
@@ -62,13 +62,15 @@ def test_health_degrades_without_taking_api_offline(client: TestClient, monkeypa
     assert response.json()["status"] == "degraded"
 
 
-def test_health_with_gemini_requires_only_local_embedding(
+def test_health_with_remote_generation_requires_only_local_embedding(
     client: TestClient, monkeypatch
 ):
     required_generation = []
     settings = SETTINGS.model_copy(update={
-        "generation_provider": "gemini",
-        "gemini_api_key": "secret",
+        "generation_provider": "remote",
+        "generation_api_key": "secret",
+        "generation_base_url": "https://gateway.test/v1",
+        "generation_model": "test-model",
     })
     main.app.dependency_overrides[main.get_settings] = lambda: settings
 
@@ -80,25 +82,29 @@ def test_health_with_gemini_requires_only_local_embedding(
             "embedding_model_available": True,
         }
 
-    async def gemini_health(_):
+    async def remote_health(_):
         return {
             "ok": True,
-            "provider": "gemini",
-            "model": settings.gemini_model,
+            "provider": "remote",
+            "model": settings.generation_model,
         }
 
     monkeypatch.setattr(main, "check_ollama", local_health)
-    monkeypatch.setattr(GeminiGenerationProvider, "health", gemini_health)
+    monkeypatch.setattr(
+        OpenAICompatibleGenerationProvider,
+        "health",
+        remote_health,
+    )
 
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["generation_provider"] == "gemini"
+    assert response.json()["generation_provider"] == "remote"
     assert response.json()["generation"] == {
         "ok": True,
-        "provider": "gemini",
-        "model": settings.gemini_model,
+        "provider": "remote",
+        "model": settings.generation_model,
     }
     assert required_generation == [False]
 
@@ -601,23 +607,26 @@ def test_settings_reads_mineru_command(monkeypatch):
 
 
 def test_settings_reads_generation_provider_configuration(monkeypatch):
-    monkeypatch.setenv("GENERATION_PROVIDER", "openai_compatible")
-    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "zen-secret")
+    monkeypatch.setenv("GENERATION_PROVIDER", "remote")
+    monkeypatch.setenv("GENERATION_API_KEY", "router-secret")
     monkeypatch.setenv(
-        "OPENAI_COMPATIBLE_BASE_URL",
+        "GENERATION_BASE_URL",
         "https://gateway.test/v1/",
     )
-    monkeypatch.setenv("OPENAI_COMPATIBLE_MODEL", "deepseek-test")
-    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.6-flash")
+    monkeypatch.setenv("GENERATION_MODEL", "nemotron-test")
+    monkeypatch.setenv(
+        "GENERATION_EXTRA_BODY",
+        '{"reasoning":{"effort":"none"}}',
+    )
     monkeypatch.setenv("OLLAMA_MODEL", "qwen3.5:9b")
 
     settings = Settings.from_env()
 
-    assert settings.generation_provider == "openai_compatible"
-    assert settings.openai_compatible_api_key == "zen-secret"
-    assert settings.openai_compatible_base_url == "https://gateway.test/v1"
-    assert settings.openai_compatible_model == "deepseek-test"
-    assert settings.gemini_api_key == "gemini-secret"
-    assert settings.gemini_model == "gemini-3.6-flash"
+    assert settings.generation_provider == "remote"
+    assert settings.generation_api_key == "router-secret"
+    assert settings.generation_base_url == "https://gateway.test/v1"
+    assert settings.generation_model == "nemotron-test"
+    assert settings.generation_extra_body == {
+        "reasoning": {"effort": "none"}
+    }
     assert settings.ollama_model == "qwen3.5:9b"

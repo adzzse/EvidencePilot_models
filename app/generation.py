@@ -54,7 +54,7 @@ class OllamaGenerationProvider:
 
 
 class OpenAICompatibleGenerationProvider:
-    name = "openai_compatible"
+    name = "remote"
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -62,7 +62,7 @@ class OpenAICompatibleGenerationProvider:
     @property
     def headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.settings.openai_compatible_api_key}"
+            "Authorization": f"Bearer {self.settings.generation_api_key}"
         }
 
     async def generate(self, system: str, prompt: str) -> GenerateResponse:
@@ -71,19 +71,18 @@ class OpenAICompatibleGenerationProvider:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         payload = {
-            "model": self.settings.openai_compatible_model,
+            **self.settings.generation_extra_body,
+            "model": self.settings.generation_model,
             "messages": messages,
             "max_tokens": 8192,
             "temperature": 0,
             "response_format": {"type": "json_object"},
             "stream": False,
         }
-        if self.settings.openai_compatible_model.startswith("deepseek-v4"):
-            payload["thinking"] = {"type": "disabled"}
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=600.0) as client:
                 response = await client.post(
-                    f"{self.settings.openai_compatible_base_url}/chat/completions",
+                    f"{self.settings.generation_base_url}/chat/completions",
                     headers=self.headers,
                     json=payload,
                 )
@@ -100,8 +99,7 @@ class OpenAICompatibleGenerationProvider:
                         raise TypeError("invalid model")
                     return GenerateResponse(
                         provider=self.name,
-                        model=returned_model
-                        or self.settings.openai_compatible_model,
+                        model=returned_model or self.settings.generation_model,
                         response=text.strip(),
                         done=True,
                     )
@@ -136,21 +134,21 @@ class OpenAICompatibleGenerationProvider:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
-                    f"{self.settings.openai_compatible_base_url}/models",
+                    f"{self.settings.generation_base_url}/models",
                     headers=self.headers,
                 )
                 response.raise_for_status()
             models = response.json()["data"]
             if not isinstance(models, list) or not any(
                 isinstance(model, dict)
-                and model.get("id") == self.settings.openai_compatible_model
+                and model.get("id") == self.settings.generation_model
                 for model in models
             ):
                 raise ValueError("configured model is unavailable")
             return {
                 "ok": True,
                 "provider": self.name,
-                "model": self.settings.openai_compatible_model,
+                "model": self.settings.generation_model,
             }
         except httpx.HTTPError as exc:
             raise GenerationUnavailableError(
@@ -162,109 +160,28 @@ class OpenAICompatibleGenerationProvider:
             ) from exc
 
 
-class GeminiGenerationProvider:
-    name = "gemini"
-    base_url = "https://generativelanguage.googleapis.com/v1beta/models"
-
-    def __init__(self, settings: Settings):
-        self.settings = settings
-
-    @property
-    def headers(self) -> dict[str, str]:
-        return {"x-goog-api-key": self.settings.gemini_api_key}
-
-    async def generate(self, system: str, prompt: str) -> GenerateResponse:
-        payload: dict[str, Any] = {
-            "contents": [{
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "maxOutputTokens": 8192,
-            },
-        }
-        if system:
-            payload["systemInstruction"] = {"parts": [{"text": system}]}
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{self.base_url}/{self.settings.gemini_model}:generateContent",
-                    headers=self.headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-            data = response.json()
-            parts = data["candidates"][0]["content"]["parts"]
-            text = "".join(
-                part["text"] for part in parts
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-            ).strip()
-            if not text:
-                raise ValueError("missing generated text")
-            model = data.get("modelVersion") or self.settings.gemini_model
-            return GenerateResponse(
-                provider=self.name,
-                model=model,
-                response=text,
-                done=True,
-            )
-        except httpx.HTTPError as exc:
-            raise GenerationUnavailableError("Gemini generation failed") from exc
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise GenerationInvalidResponseError(
-                "Gemini returned an invalid generation response"
-            ) from exc
-
-    async def health(self) -> dict[str, Any]:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(
-                    f"{self.base_url}/{self.settings.gemini_model}",
-                    headers=self.headers,
-                )
-                response.raise_for_status()
-            data = response.json()
-            if data.get("name") != f"models/{self.settings.gemini_model}":
-                raise ValueError("model name mismatch")
-            return {
-                "ok": True,
-                "provider": self.name,
-                "model": self.settings.gemini_model,
-            }
-        except httpx.HTTPError as exc:
-            raise GenerationUnavailableError("Gemini health check failed") from exc
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise GenerationInvalidResponseError(
-                "Invalid model response"
-            ) from exc
-
-
 def select_generation_provider(settings: Settings) -> GenerationProvider:
     configured = settings.generation_provider
     selected = (
-        "openai_compatible"
-        if settings.openai_compatible_api_key
+        "remote"
+        if settings.generation_api_key
         else "ollama"
     ) if configured == "auto" else configured
     if selected == "ollama":
         return OllamaGenerationProvider(settings)
-    if selected == "openai_compatible":
-        if not settings.openai_compatible_api_key:
+    if selected == "remote":
+        if not all((
+            settings.generation_api_key,
+            settings.generation_base_url,
+            settings.generation_model,
+        )):
             raise GenerationConfigurationError(
-                "OPENAI_COMPATIBLE_API_KEY is required when "
-                "GENERATION_PROVIDER=openai_compatible"
+                "GENERATION_API_KEY, GENERATION_BASE_URL, and GENERATION_MODEL "
+                "are required when GENERATION_PROVIDER=remote"
             )
         return OpenAICompatibleGenerationProvider(settings)
-    if selected == "gemini":
-        if not settings.gemini_api_key:
-            raise GenerationConfigurationError(
-                "GEMINI_API_KEY is required when GENERATION_PROVIDER=gemini"
-            )
-        return GeminiGenerationProvider(settings)
     raise GenerationConfigurationError(
-        "GENERATION_PROVIDER must be auto, ollama, gemini, or "
-        "openai_compatible"
+        "GENERATION_PROVIDER must be auto, ollama, or remote"
     )
 
 
