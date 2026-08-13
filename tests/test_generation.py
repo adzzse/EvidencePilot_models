@@ -150,7 +150,16 @@ def test_remote_rejects_malformed_response_once(monkeypatch, caplog, data):
     assert '{"unexpected":"raw-provider-body"}' in caplog.text
 
 
-def test_remote_preserves_rate_limit(monkeypatch):
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (429, GenerationRateLimitError),
+        (502, GenerationInvalidResponseError),
+        (503, GenerationUnavailableError),
+        (504, GenerationUnavailableError),
+    ],
+)
+def test_remote_preserves_http_error_status(monkeypatch, status, expected):
     class Client:
         def __init__(self, **_):
             pass
@@ -163,7 +172,7 @@ def test_remote_preserves_rate_limit(monkeypatch):
 
         async def post(self, *_args, **_kwargs):
             return httpx.Response(
-                429,
+                status,
                 request=httpx.Request(
                     "POST",
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -173,8 +182,61 @@ def test_remote_preserves_rate_limit(monkeypatch):
     monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
     provider = select_generation_provider(REMOTE_SETTINGS)
 
-    with pytest.raises(GenerationRateLimitError, match="rate limit"):
+    with pytest.raises(expected):
         asyncio.run(provider.generate("system", "prompt"))
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (429, GenerationRateLimitError),
+        (502, GenerationInvalidResponseError),
+        (503, GenerationUnavailableError),
+        (504, GenerationUnavailableError),
+    ],
+)
+def test_remote_preserves_error_envelope_status(
+    monkeypatch, caplog, code, expected
+):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = '{"error":{"code":%d}}' % code
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "error": {
+                    "code": code,
+                    "message": "provider failed",
+                    "metadata": {"error_type": "upstream_error"},
+                }
+            }
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    caplog.set_level("WARNING", logger="app.generation")
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    provider = select_generation_provider(REMOTE_SETTINGS)
+
+    with pytest.raises(expected):
+        asyncio.run(provider.generate("system", "prompt"))
+
+    assert f"code={code}" in caplog.text
+    assert "error-type='upstream_error'" in caplog.text
 
 
 def test_remote_failure_does_not_fall_back_or_expose_key(monkeypatch):

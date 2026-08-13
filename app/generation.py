@@ -89,6 +89,43 @@ class OpenAICompatibleGenerationProvider:
                 response.raise_for_status()
                 try:
                     data = response.json()
+                    error = data.get("error") if isinstance(data, dict) else None
+                    if error is not None:
+                        if not isinstance(error, dict):
+                            raise TypeError("invalid provider error")
+                        code = error.get("code")
+                        if isinstance(code, str) and code.isdigit():
+                            code = int(code)
+                        metadata = error.get("metadata")
+                        error_type = (
+                            metadata.get("error_type")
+                            if isinstance(metadata, dict)
+                            else None
+                        )
+                        logger.warning(
+                            "Provider error response: code=%r, error-type=%r "
+                            "(status=%s, content-type=%s, raw-body=%r)",
+                            code,
+                            error_type,
+                            response.status_code,
+                            response.headers.get("content-type"),
+                            response.text,
+                        )
+                        if code == 429:
+                            raise GenerationRateLimitError(
+                                "Provider rate limit exceeded"
+                            )
+                        if code == 502:
+                            raise GenerationInvalidResponseError(
+                                "Provider returned an invalid generation response"
+                            )
+                        if isinstance(code, int) and 500 <= code <= 599:
+                            raise GenerationUnavailableError(
+                                "Generation failed"
+                            )
+                        raise GenerationInvalidResponseError(
+                            "Provider returned an invalid generation response"
+                        )
                     text = data["choices"][0]["message"]["content"]
                     if not isinstance(text, str) or not text.strip():
                         raise ValueError("missing generated text")
@@ -117,6 +154,10 @@ class OpenAICompatibleGenerationProvider:
             if exc.response.status_code == 429:
                 raise GenerationRateLimitError(
                     "Provider rate limit exceeded"
+                ) from exc
+            if exc.response.status_code == 502:
+                raise GenerationInvalidResponseError(
+                    "Provider returned an invalid generation response"
                 ) from exc
             raise GenerationUnavailableError(
                 "Generation failed"
