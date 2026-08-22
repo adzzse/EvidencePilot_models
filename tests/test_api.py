@@ -537,6 +537,61 @@ def test_mineru_reads_markdown_and_normalizes_blocks(tmp_path):
     assert result.document.blocks[2].text == "| A | B |\n| --- | --- |\n| 1 | 2 |"
 
 
+def test_mineru_flat_headings_use_validated_local_hierarchy(monkeypatch):
+    blocks = tuple(
+        extraction.ExtractionBlock("heading", text, level)
+        for text, level in [
+            ("Paper title", 1),
+            ("Introduction", 2),
+            ("Study design", 2),
+            ("Results", 2),
+            ("Limitations", 2),
+        ]
+    )
+
+    async def hierarchy(_, prompt, __):
+        assert "exactly 5 headings" in prompt
+        assert '"index": 4' in prompt
+        assert '"fixed_level": 1' in prompt
+        assert "current_level" not in prompt
+        return GenerateResponse(
+            provider="ollama",
+            model="test-model",
+            response=json.dumps({"levels": [1, 2, 3, 2, 3]}),
+            done=True,
+        )
+
+    monkeypatch.setattr(extraction, "generate_text", hierarchy)
+    product = ExtractionWorkProduct(ExtractedDocument("# Paper title", blocks))
+
+    enriched = asyncio.run(extraction._enrich_mineru_hierarchy(product, SETTINGS))
+
+    assert [block.level for block in enriched.document.blocks] == [1, 2, 3, 2, 3]
+
+
+def test_mineru_keeps_flat_levels_when_hierarchy_is_invalid(monkeypatch):
+    blocks = (
+        extraction.ExtractionBlock("heading", "Paper title", 1),
+        extraction.ExtractionBlock("heading", "Introduction", 2),
+        extraction.ExtractionBlock("heading", "Study design", 2),
+    )
+
+    async def hierarchy(*_):
+        return GenerateResponse(
+            provider="ollama",
+            model="test-model",
+            response=json.dumps({"levels": [1, 4, 2]}),
+            done=True,
+        )
+
+    monkeypatch.setattr(extraction, "generate_text", hierarchy)
+    product = ExtractionWorkProduct(ExtractedDocument("# Paper title", blocks))
+
+    enriched = asyncio.run(extraction._enrich_mineru_hierarchy(product, SETTINGS))
+
+    assert enriched is product
+
+
 def test_mineru_bundle_includes_referenced_image(tmp_path):
     output_dir = tmp_path / "output"
     document_dir = output_dir / "paper"

@@ -3,7 +3,7 @@
 Stateless FastAPI service called by the Java backend. It has no RabbitMQ, MinIO,
 Qdrant, or application database access.
 
-- PDF extraction: MinerU (`mineru` CLI)
+- PDF extraction: MinerU (`mineru` CLI), with configured-provider hierarchy repair for flat headings
 - DOCX extraction: `python-docx`, normalized to Markdown and structured blocks
 - Markdown extraction: direct UTF-8 normalization to structured blocks
 - Text generation: any OpenAI-compatible API or local Ollama
