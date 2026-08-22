@@ -41,14 +41,44 @@ HEADERS = {"X-API-Key": "test-key"}
 
 @pytest.fixture(autouse=True)
 def settings_override():
+    previous_gate = main.model_call_gate
+    main.model_call_gate = main.ModelCallGate(max_concurrent=4, min_interval_ms=0)
     main.app.dependency_overrides[main.get_settings] = lambda: SETTINGS
-    yield
-    main.app.dependency_overrides.clear()
+    try:
+        yield
+    finally:
+        main.app.dependency_overrides.clear()
+        main.model_call_gate = previous_gate
 
 
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(main.app)
+
+
+def test_model_call_gate_caps_concurrency_and_spaces_starts():
+    async def exercise():
+        gate = main.ModelCallGate(max_concurrent=2, min_interval_ms=10)
+        starts = []
+        active = 0
+        max_active = 0
+
+        async def invoke():
+            nonlocal active, max_active
+            async with gate.slot():
+                starts.append(asyncio.get_running_loop().time())
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.1)
+                active -= 1
+
+        await asyncio.gather(*(invoke() for _ in range(3)))
+        return starts, max_active
+
+    starts, max_active = asyncio.run(exercise())
+
+    assert max_active == 2
+    assert all(later - earlier >= 0.007 for earlier, later in zip(starts, starts[1:]))
 
 
 def test_health_degrades_without_taking_api_offline(client: TestClient, monkeypatch):

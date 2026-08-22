@@ -17,6 +17,8 @@ class Settings(BaseModel):
     ollama_model: str = "qwen3.5:9b"
     ollama_embedding_model: str = "nomic-embed-text"
     model_api_key: str = ""
+    model_max_concurrent_requests: int = Field(default=4, ge=1)
+    model_min_interval_ms: int = Field(default=4000, ge=0)
     extraction_allowed_hosts: tuple[str, ...] = ()
     mineru_command: str = "mineru"
     mineru_backend: str = "pipeline"
@@ -45,6 +47,8 @@ class Settings(BaseModel):
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:9b"),
             ollama_embedding_model=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
             model_api_key=os.getenv("MODEL_API_KEY", ""),
+            model_max_concurrent_requests=int(os.getenv("MODEL_MAX_CONCURRENT_REQUESTS", "4")),
+            model_min_interval_ms=int(os.getenv("MODEL_MIN_INTERVAL_MS", "4000")),
             extraction_allowed_hosts=hosts,
             mineru_command=os.getenv("MINERU_COMMAND", "mineru"),
             mineru_backend=os.getenv("MINERU_BACKEND", "pipeline"),
