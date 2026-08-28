@@ -147,14 +147,14 @@ def test_remote_rejects_malformed_response_once(monkeypatch, caplog, data):
 
     assert calls == 1
     assert "Invalid provider response" in caplog.text
-    assert '{"unexpected":"raw-provider-body"}' in caplog.text
+    assert '{"unexpected":"raw-provider-body"}' not in caplog.text
 
 
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
         (429, GenerationRateLimitError),
-        (502, GenerationInvalidResponseError),
+        (502, GenerationUnavailableError),
         (503, GenerationUnavailableError),
         (504, GenerationUnavailableError),
     ],
@@ -190,7 +190,7 @@ def test_remote_preserves_http_error_status(monkeypatch, status, expected):
     ("code", "expected"),
     [
         (429, GenerationRateLimitError),
-        (502, GenerationInvalidResponseError),
+        (502, GenerationUnavailableError),
         (503, GenerationUnavailableError),
         (504, GenerationUnavailableError),
     ],
@@ -236,7 +236,61 @@ def test_remote_preserves_error_envelope_status(
         asyncio.run(provider.generate("system", "prompt"))
 
     assert f"code={code}" in caplog.text
-    assert "error-type='upstream_error'" in caplog.text
+    assert "classification=" in caplog.text
+
+
+def test_remote_surfaces_temporary_overload_without_logging_raw_body(
+    monkeypatch, caplog
+):
+    raw_body = (
+        '{"error":{"message":"Upstream error from Nvidia: '
+        'Service temporarily overloaded","code":502}}'
+    )
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = raw_body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "error": {
+                    "code": 502,
+                    "message": (
+                        "Upstream error from Nvidia: Service temporarily overloaded"
+                    ),
+                }
+            }
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    caplog.set_level("WARNING", logger="app.generation")
+    monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
+    provider = select_generation_provider(REMOTE_SETTINGS)
+
+    with pytest.raises(
+        GenerationUnavailableError,
+        match="Generation provider is temporarily overloaded",
+    ):
+        asyncio.run(provider.generate("system", "prompt"))
+
+    assert "classification=temporarily_overloaded" in caplog.text
+    assert raw_body not in caplog.text
+    assert "Nvidia" not in caplog.text
 
 
 def test_remote_failure_does_not_fall_back_or_expose_key(monkeypatch):

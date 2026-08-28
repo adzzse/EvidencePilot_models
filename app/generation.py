@@ -96,32 +96,38 @@ class OpenAICompatibleGenerationProvider:
                         code = error.get("code")
                         if isinstance(code, str) and code.isdigit():
                             code = int(code)
-                        metadata = error.get("metadata")
-                        error_type = (
-                            metadata.get("error_type")
-                            if isinstance(metadata, dict)
-                            else None
-                        )
-                        logger.warning(
-                            "Provider error response: code=%r, error-type=%r "
-                            "(status=%s, content-type=%s, raw-body=%r)",
-                            code,
-                            error_type,
-                            response.status_code,
-                            response.headers.get("content-type"),
-                            response.text,
+                        message = error.get("message")
+                        temporarily_overloaded = (
+                            isinstance(message, str)
+                            and "temporarily overloaded" in message.casefold()
                         )
                         if code == 429:
+                            classification = "rate_limited"
+                        elif temporarily_overloaded:
+                            classification = "temporarily_overloaded"
+                        elif isinstance(code, int) and 500 <= code <= 599:
+                            classification = "temporarily_unavailable"
+                        else:
+                            classification = "invalid_response"
+                        logger.warning(
+                            "Provider error response: code=%r, classification=%s "
+                            "(status=%s, content-type=%s)",
+                            code,
+                            classification,
+                            response.status_code,
+                            response.headers.get("content-type"),
+                        )
+                        if classification == "rate_limited":
                             raise GenerationRateLimitError(
                                 "Provider rate limit exceeded"
                             )
-                        if code == 502:
-                            raise GenerationInvalidResponseError(
-                                "Provider returned an invalid generation response"
-                            )
-                        if isinstance(code, int) and 500 <= code <= 599:
+                        if classification == "temporarily_overloaded":
                             raise GenerationUnavailableError(
-                                "Generation failed"
+                                "Generation provider is temporarily overloaded"
+                            )
+                        if classification == "temporarily_unavailable":
+                            raise GenerationUnavailableError(
+                                "Generation provider is temporarily unavailable"
                             )
                         raise GenerationInvalidResponseError(
                             "Provider returned an invalid generation response"
@@ -142,12 +148,11 @@ class OpenAICompatibleGenerationProvider:
                     )
                 except (KeyError, IndexError, TypeError, ValueError) as exc:
                     logger.warning(
-                        "Invalid provider response: %s: %s (status=%s, content-type=%s, raw-body=%r)",
+                        "Invalid provider response: %s: %s (status=%s, content-type=%s)",
                         type(exc).__name__,
                         exc,
                         response.status_code,
                         response.headers.get("content-type"),
-                        response.text,
                     )
                     raise
         except httpx.HTTPStatusError as exc:
@@ -155,9 +160,9 @@ class OpenAICompatibleGenerationProvider:
                 raise GenerationRateLimitError(
                     "Provider rate limit exceeded"
                 ) from exc
-            if exc.response.status_code == 502:
-                raise GenerationInvalidResponseError(
-                    "Provider returned an invalid generation response"
+            if 500 <= exc.response.status_code <= 599:
+                raise GenerationUnavailableError(
+                    "Generation provider is temporarily unavailable"
                 ) from exc
             raise GenerationUnavailableError(
                 "Generation failed"
