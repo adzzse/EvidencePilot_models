@@ -1,4 +1,5 @@
 import asyncio
+import httpx
 import io
 import json
 import logging
@@ -244,6 +245,7 @@ def test_generation_errors_map_to_gateway_status(failure, expected_status, monke
         )
 
     assert response.status_code == expected_status
+    assert response.json() == {"detail": str(failure)}
 
 
 def test_single_and_batch_embeddings_preserve_order(client: TestClient, monkeypatch):
@@ -336,6 +338,34 @@ def test_extract_rejects_untrusted_download_host(client: TestClient):
         },
     )
     assert response.status_code == 422
+
+
+def test_download_failure_logs_host_and_status_without_secret_url(
+    monkeypatch, tmp_path, caplog
+):
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(404, request=request)
+    )
+    monkeypatch.setattr(
+        extraction.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    caplog.set_level(logging.WARNING, logger=extraction.__name__)
+
+    with pytest.raises(ExtractionUnavailableError):
+        asyncio.run(extraction._download(
+            "https://storage.test/paper.pdf?token=secret-token",
+            tmp_path / "paper.pdf",
+            1024,
+        ))
+
+    assert (
+        "source_download_failed host=storage.test status=404 "
+        "error_type=HTTPStatusError"
+    ) in caplog.text
+    assert "secret-token" not in caplog.text
 
 
 def test_extraction_routes_pdf_to_configured_mineru(monkeypatch):

@@ -157,6 +157,13 @@ async def _download(url: str, destination: Path, max_bytes: int) -> None:
     except ExtractionError:
         raise
     except httpx.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        logger.warning(
+            "source_download_failed host=%s status=%s error_type=%s",
+            urlparse(url).hostname or "",
+            getattr(response, "status_code", None),
+            type(exc).__name__,
+        )
         raise ExtractionUnavailableError("could not download the source document") from exc
 
 
