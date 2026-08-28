@@ -16,14 +16,14 @@ persistence, vector indexing, retries, and the final `READY` status.
 
 ```powershell
 cd E:\Code\SEP490\EvidencePilot_models
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
+uv python install 3.13
+uv venv --python 3.13 .venv
+uv pip install --python .\.venv\Scripts\python.exe -r requirements-dev.txt
 Copy-Item .env.example .env
 ```
 
-Install MinerU separately, then set `MINERU_COMMAND` to its executable. For a
-separate Windows virtual environment, for example:
+Install MinerU separately in another Python 3.13 virtual environment, then set
+`MINERU_COMMAND` to its executable. For example:
 
 ```dotenv
 MINERU_COMMAND=.venv-mineru\Scripts\mineru.exe
