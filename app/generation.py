@@ -72,13 +72,14 @@ class OpenAICompatibleGenerationProvider:
         messages.append({"role": "user", "content": prompt})
         payload = {
             **self.settings.generation_extra_body,
-            "model": self.settings.generation_model,
             "messages": messages,
             "max_tokens": 8192,
             "temperature": 0,
             "response_format": {"type": "json_object"},
             "stream": False,
         }
+        if "models" not in payload:
+            payload["model"] = self.settings.generation_model
         try:
             async with httpx.AsyncClient(timeout=600.0) as client:
                 response = await client.post(
@@ -105,6 +106,10 @@ class OpenAICompatibleGenerationProvider:
                             classification = "rate_limited"
                         elif temporarily_overloaded:
                             classification = "temporarily_overloaded"
+                        elif code == 404:
+                            classification = "model_unavailable"
+                        elif isinstance(code, int) and 400 <= code <= 499:
+                            classification = "request_rejected"
                         elif isinstance(code, int) and 500 <= code <= 599:
                             classification = "temporarily_unavailable"
                         else:
@@ -124,6 +129,14 @@ class OpenAICompatibleGenerationProvider:
                         if classification == "temporarily_overloaded":
                             raise GenerationUnavailableError(
                                 "Generation provider is temporarily overloaded"
+                            )
+                        if classification == "model_unavailable":
+                            raise GenerationUnavailableError(
+                                "Generation model is currently unavailable"
+                            )
+                        if classification == "request_rejected":
+                            raise GenerationInvalidResponseError(
+                                "Generation provider rejected the request"
                             )
                         if classification == "temporarily_unavailable":
                             raise GenerationUnavailableError(
@@ -156,20 +169,31 @@ class OpenAICompatibleGenerationProvider:
                     )
                     raise
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
+            status_code = exc.response.status_code
+            logger.warning("Provider HTTP error: status=%s", status_code)
+            if status_code == 429:
                 raise GenerationRateLimitError(
                     "Provider rate limit exceeded"
                 ) from exc
-            if 500 <= exc.response.status_code <= 599:
+            if status_code == 404:
+                raise GenerationUnavailableError(
+                    "Generation model is currently unavailable"
+                ) from exc
+            if 400 <= status_code <= 499:
+                raise GenerationInvalidResponseError(
+                    "Generation provider rejected the request"
+                ) from exc
+            if 500 <= status_code <= 599:
                 raise GenerationUnavailableError(
                     "Generation provider is temporarily unavailable"
                 ) from exc
-            raise GenerationUnavailableError(
-                "Generation failed"
+            raise GenerationInvalidResponseError(
+                "Generation provider returned an unexpected status"
             ) from exc
         except httpx.HTTPError as exc:
+            logger.warning("Provider request failed: error_type=%s", type(exc).__name__)
             raise GenerationUnavailableError(
-                "Generation failed"
+                "Generation provider could not be reached"
             ) from exc
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise GenerationInvalidResponseError(

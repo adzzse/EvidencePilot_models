@@ -98,6 +98,25 @@ def test_remote_generation_uses_configured_openai_contract(monkeypatch):
     }
     assert "thinking" not in request["json"]
 
+    fallback_models = [
+        "minimax/minimax-m3:free",
+        REMOTE_SETTINGS.generation_model,
+    ]
+    fallback_settings = REMOTE_SETTINGS.model_copy(
+        update={
+            "generation_extra_body": {
+                "reasoning": {"effort": "none"},
+                "models": fallback_models,
+            }
+        }
+    )
+
+    asyncio.run(select_generation_provider(fallback_settings).generate("", "Reply OK"))
+
+    assert request["json"]["models"] == fallback_models
+    assert "model" not in request["json"]
+    assert request["json"]["response_format"] == {"type": "json_object"}
+
 
 @pytest.mark.parametrize(
     "data",
@@ -151,15 +170,17 @@ def test_remote_rejects_malformed_response_once(monkeypatch, caplog, data):
 
 
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("status", "expected", "message"),
     [
-        (429, GenerationRateLimitError),
-        (502, GenerationUnavailableError),
-        (503, GenerationUnavailableError),
-        (504, GenerationUnavailableError),
+        (400, GenerationInvalidResponseError, "Generation provider rejected the request"),
+        (404, GenerationUnavailableError, "Generation model is currently unavailable"),
+        (429, GenerationRateLimitError, "Provider rate limit exceeded"),
+        (502, GenerationUnavailableError, "Generation provider is temporarily unavailable"),
+        (503, GenerationUnavailableError, "Generation provider is temporarily unavailable"),
+        (504, GenerationUnavailableError, "Generation provider is temporarily unavailable"),
     ],
 )
-def test_remote_preserves_http_error_status(monkeypatch, status, expected):
+def test_remote_preserves_http_error_status(monkeypatch, status, expected, message):
     class Client:
         def __init__(self, **_):
             pass
@@ -182,21 +203,23 @@ def test_remote_preserves_http_error_status(monkeypatch, status, expected):
     monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
     provider = select_generation_provider(REMOTE_SETTINGS)
 
-    with pytest.raises(expected):
+    with pytest.raises(expected, match=message):
         asyncio.run(provider.generate("system", "prompt"))
 
 
 @pytest.mark.parametrize(
-    ("code", "expected"),
+    ("code", "expected", "message"),
     [
-        (429, GenerationRateLimitError),
-        (502, GenerationUnavailableError),
-        (503, GenerationUnavailableError),
-        (504, GenerationUnavailableError),
+        (400, GenerationInvalidResponseError, "Generation provider rejected the request"),
+        (404, GenerationUnavailableError, "Generation model is currently unavailable"),
+        (429, GenerationRateLimitError, "Provider rate limit exceeded"),
+        (502, GenerationUnavailableError, "Generation provider is temporarily unavailable"),
+        (503, GenerationUnavailableError, "Generation provider is temporarily unavailable"),
+        (504, GenerationUnavailableError, "Generation provider is temporarily unavailable"),
     ],
 )
 def test_remote_preserves_error_envelope_status(
-    monkeypatch, caplog, code, expected
+    monkeypatch, caplog, code, expected, message
 ):
     class Response:
         status_code = 200
@@ -232,7 +255,7 @@ def test_remote_preserves_error_envelope_status(
     monkeypatch.setattr("app.generation.httpx.AsyncClient", Client)
     provider = select_generation_provider(REMOTE_SETTINGS)
 
-    with pytest.raises(expected):
+    with pytest.raises(expected, match=message):
         asyncio.run(provider.generate("system", "prompt"))
 
     assert f"code={code}" in caplog.text
@@ -318,7 +341,10 @@ def test_remote_failure_does_not_fall_back_or_expose_key(monkeypatch):
     settings = REMOTE_SETTINGS.model_copy(update={"generation_provider": "auto"})
     provider = select_generation_provider(settings)
 
-    with pytest.raises(GenerationUnavailableError) as failure:
+    with pytest.raises(
+        GenerationUnavailableError,
+        match="Generation provider could not be reached",
+    ) as failure:
         asyncio.run(provider.generate("system", "prompt"))
 
     assert local_called is False
