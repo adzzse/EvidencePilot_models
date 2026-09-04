@@ -60,6 +60,23 @@ def test_generation_sends_runtime_system_and_json_options(monkeypatch):
         },
     }
 
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+    }
+    asyncio.run(generate_text(
+        "",
+        "Reply OK",
+        Settings(ollama_model="qwen3.5:9b"),
+        {
+            "type": "json_schema",
+            "json_schema": {"name": "result", "strict": True, "schema": schema},
+        },
+    ))
+
+    assert request["json"]["format"] == schema
+
 
 @pytest.mark.parametrize("model", [123, ""])
 def test_generation_rejects_malformed_ollama_metadata(monkeypatch, model):

@@ -117,6 +117,18 @@ def test_remote_generation_uses_configured_openai_contract(monkeypatch):
     assert "model" not in request["json"]
     assert request["json"]["response_format"] == {"type": "json_object"}
 
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {"type": "object"},
+        },
+    }
+    asyncio.run(provider.generate("", "Reply OK", response_format))
+
+    assert request["json"]["response_format"] == response_format
+
 
 @pytest.mark.parametrize(
     "data",

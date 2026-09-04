@@ -147,9 +147,10 @@ def test_post_endpoints_require_api_key(client: TestClient):
 def test_generate_accepts_system_and_returns_provider_metadata(
     client: TestClient, monkeypatch
 ):
-    async def generate(system, prompt, settings):
+    async def generate(system, prompt, settings, response_format):
         assert system == "Judge claim quality"
         assert prompt == "Review this"
+        assert response_format is None
         assert settings.ollama_model == SETTINGS.ollama_model
         return GenerateResponse(
             provider="ollama",
@@ -175,8 +176,9 @@ def test_generate_accepts_system_and_returns_provider_metadata(
 
 
 def test_generate_keeps_prompt_only_request_compatible(client: TestClient, monkeypatch):
-    async def generate(system, prompt, settings):
+    async def generate(system, prompt, settings, response_format):
         assert system == ""
+        assert response_format is None
         return GenerateResponse(
             provider="ollama",
             model=settings.ollama_model,
@@ -197,7 +199,7 @@ def test_generate_keeps_prompt_only_request_compatible(client: TestClient, monke
 
 
 def test_generate_accepts_whole_paper_prompt(client: TestClient, monkeypatch):
-    async def generate(_system, prompt, settings):
+    async def generate(_system, prompt, settings, _response_format):
         return GenerateResponse(
             provider="ollama",
             model=settings.ollama_model,
@@ -221,6 +223,41 @@ def test_generate_accepts_whole_paper_prompt(client: TestClient, monkeypatch):
     assert accepted.status_code == 200
     assert accepted.json()["response"] == "48000"
     assert rejected.status_code == 422
+
+
+def test_generate_passes_json_schema_response_format(client: TestClient, monkeypatch):
+    expected = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "section_standard",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"passed": {"type": "boolean"}},
+                "required": ["passed"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    async def generate(_system, _prompt, settings, response_format):
+        assert response_format == expected
+        return GenerateResponse(
+            provider="remote",
+            model=settings.generation_model or "test-model",
+            response='{"passed":true}',
+            done=True,
+        )
+
+    monkeypatch.setattr(main, "generate_text", generate)
+
+    response = client.post(
+        "/ai/generate",
+        headers=HEADERS,
+        json={"prompt": "Review this", "response_format": expected},
+    )
+
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize(

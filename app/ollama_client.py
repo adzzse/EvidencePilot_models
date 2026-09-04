@@ -46,12 +46,22 @@ async def check_ollama(
     }
 
 
-async def generate_text(system: str, prompt: str, settings: Settings) -> GenerateResponse:
+async def generate_text(
+    system: str,
+    prompt: str,
+    settings: Settings,
+    response_format: dict[str, Any] | None = None,
+) -> GenerateResponse:
+    output_format = (
+        response_format["json_schema"]["schema"]
+        if response_format and response_format["type"] == "json_schema"
+        else "json"
+    )
     payload = {
         "model": settings.ollama_model,
         "system": system,
         "prompt": prompt,
-        "format": "json",
+        "format": output_format,
         "stream": False,
         "think": False,
         "options": {

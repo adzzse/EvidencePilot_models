@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
@@ -43,11 +43,34 @@ class ExtractionManifest(BaseModel):
     images: list[str] = Field(default_factory=list)
 
 
+class JsonSchemaSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    description: str | None = Field(default=None, max_length=1024)
+    schema_: dict[str, Any] = Field(alias="schema", min_length=1)
+    strict: bool | None = None
+
+
+class JsonObjectResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["json_object"]
+
+
+class JsonSchemaResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["json_schema"]
+    json_schema: JsonSchemaSpec
+
+
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     system: str = Field(default="", max_length=8000)
     prompt: str = Field(min_length=1, max_length=48000)
+    response_format: JsonObjectResponseFormat | JsonSchemaResponseFormat | None = None
 
     @field_validator("system")
     @classmethod

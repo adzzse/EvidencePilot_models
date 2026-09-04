@@ -164,7 +164,12 @@ async def generate(
     payload: GenerateRequest,
     settings: Settings = Depends(get_settings),
 ) -> GenerateResponse:
-    return await generate_text(payload.system, payload.prompt, settings)
+    response_format = (
+        payload.response_format.model_dump(by_alias=True, exclude_none=True)
+        if payload.response_format
+        else None
+    )
+    return await generate_text(payload.system, payload.prompt, settings, response_format)
 
 
 @app.post("/ai/embeddings", response_model=EmbeddingResponse, dependencies=[Depends(limit_model_calls)])

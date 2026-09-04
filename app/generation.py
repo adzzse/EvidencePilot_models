@@ -30,7 +30,12 @@ class GenerationInvalidResponseError(RuntimeError):
 class GenerationProvider(Protocol):
     name: str
 
-    async def generate(self, system: str, prompt: str) -> GenerateResponse: ...
+    async def generate(
+        self,
+        system: str,
+        prompt: str,
+        response_format: dict[str, Any] | None = None,
+    ) -> GenerateResponse: ...
 
     async def health(self) -> dict[str, Any]: ...
 
@@ -41,8 +46,15 @@ class OllamaGenerationProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    async def generate(self, system: str, prompt: str) -> GenerateResponse:
-        return await generate_with_ollama(system, prompt, self.settings)
+    async def generate(
+        self,
+        system: str,
+        prompt: str,
+        response_format: dict[str, Any] | None = None,
+    ) -> GenerateResponse:
+        return await generate_with_ollama(
+            system, prompt, self.settings, response_format
+        )
 
     async def health(self) -> dict[str, Any]:
         result = await check_ollama(self.settings)
@@ -65,7 +77,12 @@ class OpenAICompatibleGenerationProvider:
             "Authorization": f"Bearer {self.settings.generation_api_key}"
         }
 
-    async def generate(self, system: str, prompt: str) -> GenerateResponse:
+    async def generate(
+        self,
+        system: str,
+        prompt: str,
+        response_format: dict[str, Any] | None = None,
+    ) -> GenerateResponse:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -75,7 +92,7 @@ class OpenAICompatibleGenerationProvider:
             "messages": messages,
             "max_tokens": 8192,
             "temperature": 0,
-            "response_format": {"type": "json_object"},
+            "response_format": response_format or {"type": "json_object"},
             "stream": False,
         }
         if "models" not in payload:
@@ -259,5 +276,8 @@ async def generate_text(
     system: str,
     prompt: str,
     settings: Settings,
+    response_format: dict[str, Any] | None = None,
 ) -> GenerateResponse:
-    return await select_generation_provider(settings).generate(system, prompt)
+    return await select_generation_provider(settings).generate(
+        system, prompt, response_format
+    )
