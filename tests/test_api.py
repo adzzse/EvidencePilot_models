@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 import app.extraction as extraction
 import app.main as main
+from app import limits
 from app.extraction import (
     ExtractedDocument,
     ExtractionError,
@@ -34,6 +35,7 @@ from app.settings import Settings
 
 
 SETTINGS = Settings(
+    generation_provider="ollama",
     model_api_key="test-key",
     extraction_allowed_hosts=("storage.test",),
 )
@@ -41,15 +43,14 @@ HEADERS = {"X-API-Key": "test-key"}
 
 
 @pytest.fixture(autouse=True)
-def settings_override():
-    previous_gate = main.model_call_gate
-    main.model_call_gate = main.ModelCallGate(max_concurrent=4, min_interval_ms=0)
+def settings_override(monkeypatch):
+    monkeypatch.setattr(limits, "local_gate", limits.ModelCallGate(4))
+    monkeypatch.setattr(limits, "generation_gate", limits.ModelCallGate(4))
     main.app.dependency_overrides[main.get_settings] = lambda: SETTINGS
     try:
         yield
     finally:
         main.app.dependency_overrides.clear()
-        main.model_call_gate = previous_gate
 
 
 @pytest.fixture
@@ -59,7 +60,7 @@ def client() -> TestClient:
 
 def test_model_call_gate_caps_concurrency_and_spaces_starts():
     async def exercise():
-        gate = main.ModelCallGate(max_concurrent=2, min_interval_ms=10)
+        gate = limits.ModelCallGate(max_concurrent=2, min_interval_ms=10)
         starts = []
         active = 0
         max_active = 0
@@ -138,6 +139,7 @@ def test_health_with_remote_generation_requires_only_local_embedding(
         "model": settings.generation_model,
     }
     assert required_generation == [False]
+    assert response.json()["model"] == settings.generation_model
 
 
 def test_post_endpoints_require_api_key(client: TestClient):
@@ -147,10 +149,11 @@ def test_post_endpoints_require_api_key(client: TestClient):
 def test_generate_accepts_system_and_returns_provider_metadata(
     client: TestClient, monkeypatch
 ):
-    async def generate(system, prompt, settings, response_format):
+    async def generate(system, prompt, settings, response_format, **options):
         assert system == "Judge claim quality"
         assert prompt == "Review this"
         assert response_format is None
+        assert options == {"model_index": 0, "attempt": 1, "budget_ms": 300000, "validation_feedback": None}
         assert settings.ollama_model == SETTINGS.ollama_model
         return GenerateResponse(
             provider="ollama",
@@ -172,11 +175,14 @@ def test_generate_accepts_system_and_returns_provider_metadata(
         "model": SETTINGS.ollama_model,
         "response": "done",
         "done": True,
+        "model_index": 0,
+        "attempt": 1,
+        "next_model_index": None,
     }
 
 
 def test_generate_keeps_prompt_only_request_compatible(client: TestClient, monkeypatch):
-    async def generate(system, prompt, settings, response_format):
+    async def generate(system, prompt, settings, response_format, **_options):
         assert system == ""
         assert response_format is None
         return GenerateResponse(
@@ -199,7 +205,7 @@ def test_generate_keeps_prompt_only_request_compatible(client: TestClient, monke
 
 
 def test_generate_accepts_whole_paper_prompt(client: TestClient, monkeypatch):
-    async def generate(_system, prompt, settings, _response_format):
+    async def generate(_system, prompt, settings, _response_format, **_options):
         return GenerateResponse(
             provider="ollama",
             model=settings.ollama_model,
@@ -240,7 +246,7 @@ def test_generate_passes_json_schema_response_format(client: TestClient, monkeyp
         },
     }
 
-    async def generate(_system, _prompt, settings, response_format):
+    async def generate(_system, _prompt, settings, response_format, **_options):
         assert response_format == expected
         return GenerateResponse(
             provider="remote",
@@ -270,7 +276,7 @@ def test_generate_passes_json_schema_response_format(client: TestClient, monkeyp
     ],
 )
 def test_generation_errors_map_to_gateway_status(failure, expected_status, monkeypatch):
-    async def generate(*_):
+    async def generate(*_, **_options):
         raise failure
 
     monkeypatch.setattr(main, "generate_text", generate)
@@ -282,7 +288,7 @@ def test_generation_errors_map_to_gateway_status(failure, expected_status, monke
         )
 
     assert response.status_code == expected_status
-    assert response.json() == {"detail": str(failure)}
+    assert response.json() == {"detail": str(failure), "code": failure.code}
 
 
 def test_single_and_batch_embeddings_preserve_order(client: TestClient, monkeypatch):
@@ -646,11 +652,13 @@ def test_mineru_flat_headings_use_validated_local_hierarchy(monkeypatch):
         ]
     )
 
-    async def hierarchy(_, prompt, __):
+    async def hierarchy(_, prompt, __, **options):
         assert "exactly 5 headings" in prompt
         assert '"index": 4' in prompt
         assert '"fixed_level": 1' in prompt
         assert "current_level" not in prompt
+        assert options["budget_ms"] == 30000
+        options["validate"](json.dumps({"levels": [1, 2, 3, 2, 3]}))
         return GenerateResponse(
             provider="ollama",
             model="test-model",
@@ -673,7 +681,7 @@ def test_mineru_keeps_flat_levels_when_hierarchy_is_invalid(monkeypatch):
         extraction.ExtractionBlock("heading", "Study design", 2),
     )
 
-    async def hierarchy(*_):
+    async def hierarchy(*_, **_options):
         return GenerateResponse(
             provider="ollama",
             model="test-model",
@@ -766,6 +774,7 @@ def test_settings_reads_generation_provider_configuration(monkeypatch):
         "https://gateway.test/v1/",
     )
     monkeypatch.setenv("GENERATION_MODEL", "nemotron-test")
+    monkeypatch.setenv("GENERATION_FALLBACK_MODELS", '["gemma-test", "super-test"]')
     monkeypatch.setenv(
         "GENERATION_EXTRA_BODY",
         '{"reasoning":{"effort":"none"}}',
@@ -778,7 +787,128 @@ def test_settings_reads_generation_provider_configuration(monkeypatch):
     assert settings.generation_api_key == "router-secret"
     assert settings.generation_base_url == "https://gateway.test/v1"
     assert settings.generation_model == "nemotron-test"
+    assert settings.generation_fallback_models == ["gemma-test", "super-test"]
     assert settings.generation_extra_body == {
         "reasoning": {"effort": "none"}
     }
     assert settings.ollama_model == "qwen3.5:9b"
+
+
+def test_generate_continuation_contract(client, monkeypatch):
+    async def generate(*_, **options):
+        assert options == {"model_index": 1, "attempt": 2, "budget_ms": 90000,
+                           "validation_feedback": "Quote not found"}
+        return GenerateResponse(provider="remote", model="actual", response="{}", done=True,
+                                model_index=2, attempt=1)
+
+    monkeypatch.setattr(main, "generate_text", generate)
+    response = client.post("/ai/generate", headers=HEADERS, json={
+        "prompt": "Review", "model_index": 1, "attempt": 2, "budget_ms": 90000,
+        "validation_feedback": "Quote not found",
+    })
+    assert response.status_code == 200
+    assert (response.json()["model_index"], response.json()["attempt"]) == (2, 1)
+
+
+def test_invalid_schema_returns_422_without_calling_provider(client, monkeypatch):
+    async def unexpected(*_, **__):
+        pytest.fail("Invalid schema must not call the provider")
+
+    monkeypatch.setattr(OllamaGenerationProvider, "generate", unexpected)
+    response = client.post("/ai/generate", headers=HEADERS, json={
+        "prompt": "Review", "response_format": {"type": "json_schema", "json_schema": {
+            "name": "result", "schema": {"$ref": "https://private.test/schema"},
+        }},
+    })
+    assert response.status_code == 422
+    assert response.json()["code"] == "INVALID_GENERATION_REQUEST"
+    assert "private.test" not in response.text
+
+
+def test_rate_limit_preserves_safe_retry_after(client, monkeypatch):
+    async def generate(*_, **__):
+        raise GenerationRateLimitError("Provider rate limit exceeded", retry_after=12.5)
+
+    monkeypatch.setattr(main, "generate_text", generate)
+    response = client.post("/ai/generate", headers=HEADERS, json={"prompt": "Review"})
+    assert response.status_code == 429 and response.headers["Retry-After"] == "13"
+
+
+def test_hierarchy_releases_local_slot_before_remote_call(monkeypatch):
+    from app.ollama_client import generate_embeddings
+
+    product = ExtractionWorkProduct(ExtractedDocument("# Title", (
+        extraction.ExtractionBlock("heading", "Title", 1),
+        extraction.ExtractionBlock("heading", "Introduction", 2),
+        extraction.ExtractionBlock("heading", "Methods", 2),
+    )))
+
+    async def download(*_):
+        pass
+
+    async def mineru(*_):
+        return product
+
+    async def hierarchy(*_, **options):
+        # This would deadlock with max_concurrent=1 if extraction still held its slot.
+        vectors = await asyncio.wait_for(generate_embeddings(["synthetic"], SETTINGS), 0.5)
+        assert vectors == [[1.0]]
+        raise GenerationUnavailableError("Generation batch deadline exceeded")
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json={"embeddings": [[1.0]]}))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs))
+    monkeypatch.setattr(limits, "local_gate", limits.ModelCallGate(1))
+    monkeypatch.setattr(limits, "generation_gate", limits.ModelCallGate(1))
+    monkeypatch.setattr(extraction, "_download", download)
+    monkeypatch.setattr(extraction, "extract_with_mineru", mineru)
+    monkeypatch.setattr(extraction, "generate_text", hierarchy)
+
+    async def exercise():
+        async with limits.generation_gate.slot():
+            return await extract_from_url(ExtractRequest(
+                filename="paper.pdf", download_url="https://storage.test/paper.pdf",
+            ), SETTINGS)
+
+    assert asyncio.run(exercise()) is product.document
+
+
+def test_mineru_cancellation_stops_process_and_drains_streams(monkeypatch, tmp_path):
+    class Process:
+        returncode = None
+        killed = False
+
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.started = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def wait(self):
+            self.started.set()
+            await self.finished.wait()
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -1
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.finished.set()
+
+    async def exercise():
+        process = Process()
+
+        async def start(*_, **__):
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+        task = asyncio.create_task(extraction.extract_with_mineru(
+            tmp_path / "paper.pdf", tmp_path / "out", 60, "mineru", "pipeline",
+        ))
+        await process.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.killed and process.stdout.at_eof() and process.stderr.at_eof()
+
+    asyncio.run(exercise())

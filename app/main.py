@@ -1,9 +1,8 @@
-import asyncio
 import logging
+import math
 import os
 import secrets
 import tempfile
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -17,8 +16,10 @@ from app.extraction import (
 )
 from app.generation import (
     GenerationConfigurationError,
+    GenerationError,
     GenerationInvalidResponseError,
     GenerationRateLimitError,
+    GenerationRequestError,
     GenerationUnavailableError,
     generate_text,
     select_generation_provider,
@@ -44,33 +45,7 @@ from app.settings import Settings, load_settings
 logging.basicConfig(level=logging.INFO)
 
 
-class ModelCallGate:
-    # ponytail: process-local; use a distributed limiter before adding workers/instances.
-    def __init__(self, max_concurrent: int, min_interval_ms: int):
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._pace_lock = asyncio.Lock()
-        self._min_interval_seconds = max(0, min_interval_ms) / 1000
-        self._next_start = 0.0
-
-    @asynccontextmanager
-    async def slot(self):
-        async with self._semaphore:
-            async with self._pace_lock:
-                loop = asyncio.get_running_loop()
-                delay = self._next_start - loop.time()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                now = loop.time()
-                self._next_start = max(now, self._next_start) + self._min_interval_seconds
-            yield
-
-
 app = FastAPI(title="EvidencePilot AI Worker", version="1.0.0")
-_settings = load_settings()
-model_call_gate = ModelCallGate(
-    _settings.model_max_concurrent_requests,
-    _settings.model_min_interval_ms,
-)
 
 
 def get_settings() -> Settings:
@@ -85,11 +60,6 @@ def require_api_key(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "MODEL_API_KEY is not configured")
     if api_key is None or not secrets.compare_digest(api_key, settings.model_api_key):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid API key")
-
-
-async def limit_model_calls(_authorized: None = Depends(require_api_key)):
-    async with model_call_gate.slot():
-        yield
 
 
 @app.get("/health")
@@ -127,7 +97,7 @@ async def health(settings: Settings = Depends(get_settings)) -> dict:
             ollama = {"ok": False, "error": str(exc)}
     return {
         "status": "ok" if generation.get("ok") and ollama.get("ok") else "degraded",
-        "model": settings.ollama_model,
+        "model": generation.get("model"),
         "embedding_model": settings.ollama_embedding_model,
         "ollama": ollama,
         "generation_provider": generation_provider,
@@ -135,7 +105,7 @@ async def health(settings: Settings = Depends(get_settings)) -> dict:
     }
 
 
-@app.post("/extract", dependencies=[Depends(limit_model_calls)])
+@app.post("/extract", dependencies=[Depends(require_api_key)])
 async def extract_document(
     payload: ExtractRequest,
     settings: Settings = Depends(get_settings),
@@ -148,7 +118,7 @@ async def extract_document(
     bundle_path = Path(raw_path)
     try:
         await create_extraction_bundle(payload, settings, bundle_path)
-    except Exception:
+    except BaseException:
         bundle_path.unlink(missing_ok=True)
         raise
     return FileResponse(
@@ -159,7 +129,7 @@ async def extract_document(
     )
 
 
-@app.post("/ai/generate", response_model=GenerateResponse, dependencies=[Depends(limit_model_calls)])
+@app.post("/ai/generate", response_model=GenerateResponse, dependencies=[Depends(require_api_key)])
 async def generate(
     payload: GenerateRequest,
     settings: Settings = Depends(get_settings),
@@ -169,10 +139,14 @@ async def generate(
         if payload.response_format
         else None
     )
-    return await generate_text(payload.system, payload.prompt, settings, response_format)
+    return await generate_text(
+        payload.system, payload.prompt, settings, response_format,
+        model_index=payload.model_index, attempt=payload.attempt,
+        budget_ms=payload.budget_ms, validation_feedback=payload.validation_feedback,
+    )
 
 
-@app.post("/ai/embeddings", response_model=EmbeddingResponse, dependencies=[Depends(limit_model_calls)])
+@app.post("/ai/embeddings", response_model=EmbeddingResponse, dependencies=[Depends(require_api_key)])
 async def embedding(
     payload: EmbeddingRequest,
     settings: Settings = Depends(get_settings),
@@ -184,7 +158,7 @@ async def embedding(
 @app.post(
     "/ai/embeddings/batch",
     response_model=BatchEmbeddingResponse,
-    dependencies=[Depends(limit_model_calls)],
+    dependencies=[Depends(require_api_key)],
 )
 async def batch_embeddings(
     payload: BatchEmbeddingRequest,
@@ -194,8 +168,9 @@ async def batch_embeddings(
 
 
 @app.exception_handler(ExtractionError)
+@app.exception_handler(GenerationRequestError)
 async def extraction_error_handler(_, exc: ExtractionError):
-    return JSONResponse(status_code=422, content={"detail": str(exc)})
+    return _error_response(422, exc)
 
 
 @app.exception_handler(ExtractionUnavailableError)
@@ -203,15 +178,25 @@ async def extraction_error_handler(_, exc: ExtractionError):
 @app.exception_handler(GenerationConfigurationError)
 @app.exception_handler(GenerationUnavailableError)
 async def unavailable_handler(_, exc: RuntimeError):
-    return JSONResponse(status_code=503, content={"detail": str(exc)})
+    return _error_response(503, exc)
 
 
 @app.exception_handler(GenerationRateLimitError)
 async def rate_limit_handler(_, exc: GenerationRateLimitError):
-    return JSONResponse(status_code=429, content={"detail": str(exc)})
+    return _error_response(429, exc)
 
 
 @app.exception_handler(OllamaInvalidResponseError)
 @app.exception_handler(GenerationInvalidResponseError)
 async def invalid_upstream_handler(_, exc: RuntimeError):
-    return JSONResponse(status_code=502, content={"detail": str(exc)})
+    return _error_response(502, exc)
+
+
+def _error_response(status_code: int, exc: Exception) -> JSONResponse:
+    content = {"detail": str(exc)}
+    headers = {}
+    if isinstance(exc, GenerationError):
+        content["code"] = exc.code
+        if exc.retry_after is not None:
+            headers["Retry-After"] = str(math.ceil(exc.retry_after))
+    return JSONResponse(status_code=status_code, content=content, headers=headers)

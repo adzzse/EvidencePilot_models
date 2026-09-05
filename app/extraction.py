@@ -17,13 +17,8 @@ from docx import Document as load_docx
 from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
 
-from app.generation import (
-    GenerationConfigurationError,
-    GenerationInvalidResponseError,
-    GenerationRateLimitError,
-    GenerationUnavailableError,
-    generate_text,
-)
+from app import limits
+from app.generation import GenerationError, generate_text
 from app.models import ExtractionManifest, ExtractRequest
 from app.ollama_client import (
     OllamaInvalidResponseError,
@@ -104,27 +99,21 @@ async def _extract_in_work_dir(
         raise ExtractionError("only PDF, DOCX, and Markdown files are supported")
 
     input_path = work_dir / f"input{suffix}"
-    await _download(str(payload.download_url), input_path, settings.max_download_bytes)
-    if suffix == ".pdf":
-        product = await extract_with_mineru(
-            input_path,
-            work_dir / "output",
-            settings.mineru_timeout_seconds,
-            settings.mineru_command,
-            settings.mineru_backend,
-        )
-        return await _enrich_mineru_hierarchy(product, settings)
-    if suffix == ".docx":
-        document = await asyncio.to_thread(
-            _read_docx,
-            input_path,
-            settings.max_download_bytes,
-        )
-    else:
-        document = _read_markdown(input_path)
-    return ExtractionWorkProduct(
-        ExtractedDocument(_clean(document.markdown), tuple(document.blocks)),
-    )
+    async with limits.local_gate.slot():
+        await _download(str(payload.download_url), input_path, settings.max_download_bytes)
+        if suffix == ".pdf":
+            product = await extract_with_mineru(
+                input_path, work_dir / "output", settings.mineru_timeout_seconds,
+                settings.mineru_command, settings.mineru_backend,
+            )
+        else:
+            document = (await asyncio.to_thread(_read_docx, input_path, settings.max_download_bytes)
+                        if suffix == ".docx" else _read_markdown(input_path))
+            return ExtractionWorkProduct(
+                ExtractedDocument(_clean(document.markdown), tuple(document.blocks)),
+            )
+    # Remote hierarchy repair must not hold a local extraction/embedding slot.
+    return await _enrich_mineru_hierarchy(product, settings)
 
 
 def _write_extraction_bundle(
@@ -207,10 +196,13 @@ async def extract_with_mineru(
     stderr_task = asyncio.create_task(_stream_mineru_output(process.stderr))
     try:
         await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
-    except asyncio.TimeoutError as exc:
-        process.kill()
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        if process.returncode is None:
+            process.kill()
         await process.wait()
         await asyncio.gather(stdout_task, stderr_task)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         raise ExtractionUnavailableError(f"MinerU timed out after {timeout_seconds}s") from exc
 
     _, stderr = await asyncio.gather(stdout_task, stderr_task)
@@ -382,6 +374,8 @@ async def _enrich_mineru_hierarchy(
             "Classify the logical hierarchy of extracted document headings.",
             prompt,
             settings,
+            budget_ms=30000,
+            validate=lambda response: _validated_heading_levels(response, headings),
         )
         if not generated.done:
             raise ValueError("incomplete hierarchy response")
@@ -389,10 +383,7 @@ async def _enrich_mineru_hierarchy(
     except (
         OllamaUnavailableError,
         OllamaInvalidResponseError,
-        GenerationConfigurationError,
-        GenerationUnavailableError,
-        GenerationRateLimitError,
-        GenerationInvalidResponseError,
+        GenerationError,
         ValueError,
     ) as exc:
         logger.warning("Keeping MinerU heading levels: %s", exc)

@@ -3,6 +3,7 @@ from typing import Any
 
 import httpx
 
+from app import limits
 from app.models import GenerateResponse
 from app.settings import Settings
 
@@ -41,7 +42,7 @@ async def check_ollama(
         "ok": embedding_model_available and (
             model_available or not require_generation
         ),
-        "model_available": model_available,
+        **({"model_available": model_available} if require_generation else {}),
         "embedding_model_available": embedding_model_available,
     }
 
@@ -72,7 +73,7 @@ async def generate_text(
         },
     }
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with limits.local_gate.slot(), httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(f"{settings.ollama_base_url}/api/generate", json=payload)
             response.raise_for_status()
         data = response.json()
@@ -91,7 +92,7 @@ async def generate_text(
 async def generate_embeddings(texts: list[str], settings: Settings) -> list[list[float]]:
     payload = {"model": settings.ollama_embedding_model, "input": texts}
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with limits.local_gate.slot(), httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(f"{settings.ollama_base_url}/api/embed", json=payload)
             response.raise_for_status()
         embeddings = response.json().get("embeddings")

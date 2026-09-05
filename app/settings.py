@@ -8,10 +8,11 @@ from pydantic import BaseModel, Field
 
 
 class Settings(BaseModel):
-    generation_provider: str = "auto"
+    generation_provider: str = "remote"
     generation_api_key: str = ""
     generation_base_url: str = ""
     generation_model: str = ""
+    generation_fallback_models: list[str] = Field(default_factory=list, max_length=2)
     generation_extra_body: dict[str, Any] = Field(default_factory=dict)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:9b"
@@ -34,12 +35,15 @@ class Settings(BaseModel):
             if host.strip()
         )
         return cls(
-            generation_provider=os.getenv("GENERATION_PROVIDER", "auto").strip().lower(),
+            generation_provider=os.getenv("GENERATION_PROVIDER", "remote").strip().lower(),
             generation_api_key=os.getenv("GENERATION_API_KEY", "").strip(),
             generation_base_url=os.getenv("GENERATION_BASE_URL", "")
             .strip()
             .rstrip("/"),
             generation_model=os.getenv("GENERATION_MODEL", "").strip(),
+            generation_fallback_models=json.loads(
+                os.getenv("GENERATION_FALLBACK_MODELS", "[]") or "[]"
+            ),
             generation_extra_body=json.loads(
                 os.getenv("GENERATION_EXTRA_BODY", "{}") or "{}"
             ),

@@ -166,3 +166,14 @@ def test_health_degrades_when_a_required_model_is_missing(monkeypatch):
     result = asyncio.run(check_ollama(Settings()))
 
     assert result["ok"] is False
+
+
+def test_embedding_only_health_does_not_advertise_local_generation(monkeypatch):
+    import httpx
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json={
+        "models": [{"name": "nomic-embed-text:latest"}],
+    }))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs))
+    result = asyncio.run(check_ollama(Settings(), require_generation=False))
+    assert result == {"ok": True, "embedding_model_available": True}

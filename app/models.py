@@ -71,6 +71,10 @@ class GenerateRequest(BaseModel):
     system: str = Field(default="", max_length=8000)
     prompt: str = Field(min_length=1, max_length=48000)
     response_format: JsonObjectResponseFormat | JsonSchemaResponseFormat | None = None
+    model_index: int = Field(default=0, ge=0, le=2, strict=True)
+    attempt: int = Field(default=1, ge=1, le=2, strict=True)
+    budget_ms: int = Field(default=300000, gt=0, le=300000, strict=True)
+    validation_feedback: str | None = Field(default=None, max_length=2000)
 
     @field_validator("system")
     @classmethod
@@ -91,6 +95,9 @@ class GenerateResponse(BaseModel):
     model: str = Field(min_length=1)
     response: str = Field(min_length=1)
     done: bool
+    model_index: int = Field(default=0, ge=0, le=2)
+    attempt: int = Field(default=1, ge=1, le=2)
+    next_model_index: int | None = Field(default=None, ge=0, le=2)
 
 
 class EmbeddingRequest(BaseModel):
