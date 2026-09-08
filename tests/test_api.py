@@ -411,6 +411,68 @@ def test_download_failure_logs_host_and_status_without_secret_url(
     assert "secret-token" not in caplog.text
 
 
+@pytest.mark.parametrize("provider", ["remote", "ollama"])
+@pytest.mark.parametrize("enrich_hierarchy", [False, True, None])
+def test_pdf_extract_only_calls_generation_for_hierarchy(monkeypatch, provider, enrich_hierarchy):
+    settings = SETTINGS.model_copy(update={
+        "generation_provider": provider,
+        "generation_api_key": "test-provider-key",
+        "generation_base_url": "https://generation.test/v1",
+        "generation_model": "test-model",
+        "generation_fallback_models": (),
+    })
+    main.app.dependency_overrides[main.get_settings] = lambda: settings
+    blocks = tuple(
+        extraction.ExtractionBlock("heading", text, level)
+        for text, level in [
+            ("Title", 1), ("Introduction", 2), ("Study design", 2), ("Results", 2),
+        ]
+    ) + (extraction.ExtractionBlock("paragraph", "Source content."),)
+    markdown = "# Title\n\nSource content.\n\n![](images/figure.jpg)"
+    calls = []
+
+    def upstream(request):
+        if request.method == "GET" and request.url.host == "storage.test":
+            return httpx.Response(200, content=b"%PDF-test")
+        calls.append(request.url.path)
+        response = json.dumps({"levels": [1, 2, 3, 2]})
+        return httpx.Response(200, json={
+            "model": "test-model", "response": response, "done": True,
+            "choices": [{"finish_reason": "stop", "message": {"content": response}}],
+        })
+
+    async def mineru(pdf_path, output_dir, *_):
+        assert pdf_path.read_bytes() == b"%PDF-test"
+        image_path = output_dir / "images" / "figure.jpg"
+        image_path.parent.mkdir(parents=True)
+        image_path.write_bytes(b"jpeg")
+        return ExtractionWorkProduct(
+            ExtractedDocument(markdown, blocks, ("images/figure.jpg",)),
+            (("images/figure.jpg", image_path),),
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(upstream)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs))
+    monkeypatch.setattr(extraction, "extract_with_mineru", mineru)
+    with TestClient(main.app) as client:
+        result = client.post("/extract", headers=HEADERS, json={
+            "filename": "source.pdf", "download_url": "https://storage.test/source.pdf",
+            **({"enrich_hierarchy": enrich_hierarchy} if enrich_hierarchy is not None else {}),
+        })
+
+    assert result.status_code == 200
+    expected_levels = [1, 2, 2, 2] if enrich_hierarchy is False else [1, 2, 3, 2]
+    assert len(calls) == (0 if enrich_hierarchy is False else 1)
+    with zipfile.ZipFile(io.BytesIO(result.content)) as archive:
+        manifest = json.loads(archive.read("extraction.json"))
+        assert [block["level"] for block in manifest["blocks"] if block["type"] == "heading"] == expected_levels
+        assert manifest["blocks"][-1]["text"] == "Source content."
+        assert manifest["images"] == ["images/figure.jpg"]
+        assert archive.read("document.md").decode() == markdown
+        assert archive.read("images/figure.jpg") == b"jpeg"
+
+
 def test_extraction_routes_pdf_to_configured_mineru(monkeypatch):
     received = {}
     blocks = (SimpleNamespace(type="paragraph", text="Extracted", level=None, caption=None),)

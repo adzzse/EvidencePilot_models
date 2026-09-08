@@ -112,7 +112,9 @@ async def _extract_in_work_dir(
             return ExtractionWorkProduct(
                 ExtractedDocument(_clean(document.markdown), tuple(document.blocks)),
             )
-    # Remote hierarchy repair must not hold a local extraction/embedding slot.
+    if not payload.enrich_hierarchy:
+        return product
+    # Paper hierarchy repair must not hold a local extraction/embedding slot.
     return await _enrich_mineru_hierarchy(product, settings)
 
 

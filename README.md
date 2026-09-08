@@ -3,7 +3,7 @@
 Stateless FastAPI service called by the Java backend. It has no RabbitMQ, MinIO,
 Qdrant, or application database access.
 
-- PDF extraction: MinerU (`mineru` CLI), with configured-provider hierarchy repair for flat headings
+- PDF extraction: MinerU (`mineru` CLI); Paper requests retain configured-provider hierarchy repair, Source requests disable it
 - DOCX extraction: `python-docx`, normalized to Markdown and structured blocks
 - Markdown extraction: direct UTF-8 normalization to structured blocks
 - Text generation: OpenRouter, with ordered remote model fallback
@@ -66,7 +66,7 @@ and temporary 503 responses is honored within the batch budget.
 
 The batch budget is at most 300 seconds including queueing, pacing and all
 attempts (at most two per model, six total); each remote HTTP attempt is capped
-at 60 seconds. Flat PDF heading repair has a separate 30-second budget and keeps
+at 60 seconds. Paper PDF heading repair has a separate 30-second budget and keeps
 the MinerU result on failure.
 Embeddings and document extraction always remain local. Generation context,
 including Claims, source chunks, paper sections, and feedback, is sent to the
@@ -85,7 +85,7 @@ not suitable for the presigned download URL.
 Run one Python worker: `MODEL_MAX_CONCURRENT_REQUESTS` caps each of two independent
 process-local pools, remote generation and local extraction/embedding.
 `MODEL_MIN_INTERVAL_MS` spaces every remote attempt, including fallback and
-heading repair. Local calls have no remote pacing delay.
+Paper heading repair. Local calls have no remote pacing delay.
 
 Before activating the full chain for Java traffic, update Java to consume the
 continuation fields below and remove its duplicate generation retries. The
@@ -114,10 +114,20 @@ generation availability is not required or advertised in remote mode.
 
 ```json
 {
-  "filename": "paper.pdf",
-  "download_url": "https://storage.example.com/presigned-object"
+  "filename": "source.pdf",
+  "download_url": "https://storage.example.com/presigned-object",
+  "enrich_hierarchy": false
 }
 ```
+
+Java sends `enrich_hierarchy=false` for Source documents and `true` for Papers.
+Source extraction returns MinerU headings without invoking a generation provider;
+Paper extraction retains hierarchy repair for flat PDF headings. Omitted values
+default to `true` for compatibility with older callers. DOCX and Markdown do not
+use generation regardless of this flag. Source and Paper PDF bundles use separate
+cache entries in Java; existing per-document checkpoints remain reusable.
+Roll out the Python service first, then the Java backend: older Python versions
+reject the new request field, while this version still accepts older Java requests.
 
 The service downloads only an allowlisted PDF, DOCX, or Markdown file and
 returns a ZIP containing `document.md`, `extraction.json`, and any referenced

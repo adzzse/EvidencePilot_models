@@ -8,6 +8,7 @@ class ExtractRequest(BaseModel):
 
     filename: str = Field(min_length=1, max_length=255)
     download_url: HttpUrl
+    enrich_hierarchy: bool = True
 
 
 class ExtractionBlock(BaseModel):
