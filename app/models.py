@@ -20,6 +20,7 @@ class ExtractionBlock(BaseModel):
         "list",
         "table",
         "figure_caption",
+        "image",
         "equation",
         "code",
         "reference",

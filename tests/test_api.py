@@ -812,13 +812,21 @@ def test_mineru_bundle_includes_referenced_image(tmp_path):
     (document_dir / "paper_content_list.json").write_text(
         json.dumps([
             {"type": "text", "text": "Result", "text_level": 1},
-            {"type": "image", "img_path": "images/figure.jpg"},
+            {
+                "type": "image",
+                "img_path": "images/figure.jpg",
+                "image_caption": ["Figure 3. Architecture"],
+            },
         ]),
         encoding="utf-8",
     )
 
     product = extraction._read_mineru_output(output_dir, "paper")
 
+    assert [(block.type, block.text, block.caption) for block in product.document.blocks] == [
+        ("heading", "Result", None),
+        ("image", "images/figure.jpg", "Figure 3. Architecture"),
+    ]
     assert product.document.images == ("images/figure.jpg",)
     assert product.image_files == (("images/figure.jpg", image_path),)
 
@@ -856,6 +864,12 @@ def test_extraction_block_level_is_only_valid_for_headings():
         ExtractionBlock(type="heading", text="Methods")
     with pytest.raises(ValueError):
         ExtractionBlock(type="paragraph", text="Body", level=2)
+    image = ExtractionBlock(
+        type="image",
+        text="images/figure.jpg",
+        caption="Figure 3. Architecture",
+    )
+    assert image.level is None
 
 
 def test_settings_reads_mineru_command(monkeypatch):

@@ -251,26 +251,17 @@ def _mineru_images(
     content_list: list[dict[str, Any]],
     output_root: Path,
 ) -> tuple[tuple[str, Path], ...]:
-    allowed = {".jpg", ".jpeg", ".png", ".webp"}
     found: list[tuple[str, Path]] = []
     seen: set[str] = set()
     root = output_root.resolve()
 
     for item in content_list:
-        raw = item.get("img_path") if isinstance(item, dict) else None
-        if not isinstance(raw, str) or not raw:
+        if not isinstance(item, dict):
             continue
-        relative = PurePosixPath(raw)
-        if (
-            relative.is_absolute()
-            or "\\" in raw
-            or ".." in relative.parts
-            or len(relative.parts) < 2
-            or relative.parts[0] != "images"
-            or relative.suffix.lower() not in allowed
-        ):
-            raise ExtractionUnavailableError("MinerU image path is invalid")
-        normalized = relative.as_posix()
+        normalized = _mineru_image_path(item)
+        if normalized is None:
+            continue
+        relative = PurePosixPath(normalized)
         source = (root / Path(*relative.parts)).resolve()
         try:
             source.relative_to(root)
@@ -283,6 +274,23 @@ def _mineru_images(
             found.append((normalized, source))
 
     return tuple(found)
+
+
+def _mineru_image_path(item: dict[str, Any]) -> str | None:
+    raw = item.get("img_path")
+    if not isinstance(raw, str) or not raw:
+        return None
+    relative = PurePosixPath(raw)
+    if (
+        relative.is_absolute()
+        or "\\" in raw
+        or ".." in relative.parts
+        or len(relative.parts) < 2
+        or relative.parts[0] != "images"
+        or relative.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
+    ):
+        raise ExtractionUnavailableError("MinerU image path is invalid")
+    return relative.as_posix()
 
 
 def _normalize_mineru_blocks(content_list: list[dict[str, Any]]) -> list[ExtractionBlock]:
@@ -311,6 +319,15 @@ def _normalize_mineru_blocks(content_list: list[dict[str, Any]]) -> list[Extract
                 ))
             continue
 
+        if item_type in {"image", "figure"}:
+            caption = _caption(item, "image_caption")
+            image_path = _mineru_image_path(item)
+            if image_path:
+                blocks.append(ExtractionBlock("image", image_path, caption=caption))
+            elif caption:
+                blocks.append(ExtractionBlock("figure_caption", caption))
+            continue
+
         is_reference = reference_level is not None or item.get("sub_type") == "ref_text"
         if is_reference:
             if text:
@@ -325,10 +342,6 @@ def _normalize_mineru_blocks(content_list: list[dict[str, Any]]) -> list[Extract
             table = _table_to_markdown(str(item.get("table_body", "")))
             if table:
                 blocks.append(ExtractionBlock("table", table, caption=_caption(item, "table_caption")))
-        elif item_type in {"image", "figure"}:
-            caption = _caption(item, "image_caption")
-            if caption:
-                blocks.append(ExtractionBlock("figure_caption", caption))
         elif item_type in {"equation", "interline_equation"} and text:
             blocks.append(ExtractionBlock("equation", text))
         elif item_type == "code" and text:
