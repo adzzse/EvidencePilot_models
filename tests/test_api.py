@@ -25,6 +25,7 @@ from app.extraction import (
 from app.models import ExtractRequest, ExtractionBlock, GenerateResponse
 from app.generation import (
     GenerationConfigurationError,
+    GenerationConfigChangedError,
     GenerationInvalidResponseError,
     GenerationRateLimitError,
     GenerationUnavailableError,
@@ -146,6 +147,26 @@ def test_post_endpoints_require_api_key(client: TestClient):
     assert client.post("/ai/embeddings", json={"text": "claim"}).status_code == 401
 
 
+def test_generation_config_is_authenticated_and_contains_no_secret(client):
+    assert client.get("/ai/generation-config").status_code == 401
+    assert client.get("/ai/generation-config", headers={"X-API-Key": "wrong"}).status_code == 401
+    settings = SETTINGS.model_copy(update={
+        "generation_provider": "remote", "generation_api_key": "provider-secret",
+        "generation_base_url": "https://gateway.test/v1", "generation_model": "model-a",
+        "generation_fallback_models": ["model-b"],
+    })
+    main.app.dependency_overrides[main.get_settings] = lambda: settings
+    response = client.get("/ai/generation-config", headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["allowed_models"] == ["model-a", "model-b"]
+    assert "provider-secret" not in response.text
+
+
+def test_generation_config_requires_server_key(client):
+    main.app.dependency_overrides[main.get_settings] = lambda: SETTINGS.model_copy(update={"model_api_key": ""})
+    assert client.get("/ai/generation-config", headers=HEADERS).status_code == 503
+
+
 def test_generate_accepts_system_and_returns_provider_metadata(
     client: TestClient, monkeypatch
 ):
@@ -202,6 +223,24 @@ def test_generate_keeps_prompt_only_request_compatible(client: TestClient, monke
 
     assert response.status_code == 200
     assert response.json()["response"] == "Review this"
+
+
+def test_generate_forwards_selected_chain_and_returns_fingerprint(client, monkeypatch):
+    fingerprint = "a" * 64
+
+    async def generate(_system, _prompt, _settings, _response_format, **options):
+        assert options["model_ids"] == ["model-b", "model-a"]
+        assert options["catalog_fingerprint"] == fingerprint
+        return GenerateResponse(provider="remote", model="model-b", response="{}", done=True,
+                                catalog_fingerprint=fingerprint)
+
+    monkeypatch.setattr(main, "generate_text", generate)
+    response = client.post("/ai/generate", headers=HEADERS, json={
+        "prompt": "Review", "model_ids": ["model-b", "model-a"],
+        "catalog_fingerprint": fingerprint,
+    })
+    assert response.status_code == 200
+    assert response.json()["catalog_fingerprint"] == fingerprint
 
 
 def test_generate_accepts_whole_paper_prompt(client: TestClient, monkeypatch):
@@ -270,6 +309,7 @@ def test_generate_passes_json_schema_response_format(client: TestClient, monkeyp
     ("failure", "expected_status"),
     [
         (GenerationConfigurationError("bad config"), 503),
+        (GenerationConfigChangedError("stale catalog"), 409),
         (GenerationUnavailableError("offline"), 503),
         (GenerationRateLimitError("rate limited"), 429),
         (GenerationInvalidResponseError("malformed"), 502),
@@ -885,6 +925,19 @@ def test_invalid_schema_returns_422_without_calling_provider(client, monkeypatch
     assert response.status_code == 422
     assert response.json()["code"] == "INVALID_GENERATION_REQUEST"
     assert "private.test" not in response.text
+
+
+def test_system_character_limit(client, monkeypatch):
+    async def generate(*_, **__):
+        return GenerateResponse(provider="remote", model="test-model", response="{}", done=True)
+
+    monkeypatch.setattr(main, "generate_text", generate)
+    invalid = client.post("/ai/generate", headers=HEADERS, json={"system": "x" * 8001, "prompt": "Review"})
+    assert invalid.status_code == 422
+    valid = client.post("/ai/generate", headers=HEADERS, json={"system": "x" * 8000, "prompt": "Review"})
+    assert valid.status_code == 200
+    assert client.post("/ai/generate", headers=HEADERS, json={"system": "😀" * 8000, "prompt": "Review"}).status_code == 200
+    assert client.post("/ai/generate", headers=HEADERS, json={"system": "x" * 8000 + " ", "prompt": "Review"}).status_code == 422
 
 
 def test_rate_limit_preserves_safe_retry_after(client, monkeypatch):

@@ -76,6 +76,19 @@ class GenerateRequest(BaseModel):
     attempt: int = Field(default=1, ge=1, le=2, strict=True)
     budget_ms: int = Field(default=300000, gt=0, le=300000, strict=True)
     validation_feedback: str | None = Field(default=None, max_length=2000)
+    model_ids: list[str] | None = Field(default=None, min_length=1, max_length=3)
+    catalog_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_model_selection(self):
+        if (self.model_ids is None) != (self.catalog_fingerprint is None):
+            raise ValueError("model_ids and catalog_fingerprint must be provided together")
+        if self.model_ids is not None:
+            if len(set(self.model_ids)) != len(self.model_ids):
+                raise ValueError("model_ids must be distinct")
+            if any(not model.strip() or len(model) > 255 for model in self.model_ids):
+                raise ValueError("model_ids must contain valid model IDs")
+        return self
 
     @field_validator("system")
     @classmethod
@@ -99,6 +112,7 @@ class GenerateResponse(BaseModel):
     model_index: int = Field(default=0, ge=0, le=2)
     attempt: int = Field(default=1, ge=1, le=2)
     next_model_index: int | None = Field(default=None, ge=0, le=2)
+    catalog_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class EmbeddingRequest(BaseModel):

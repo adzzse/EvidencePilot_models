@@ -43,8 +43,8 @@ Configure the OpenRouter generation chain:
 GENERATION_PROVIDER=remote
 GENERATION_API_KEY=
 GENERATION_BASE_URL=https://openrouter.ai/api/v1
-GENERATION_MODEL=minimax/minimax-m3:free
-GENERATION_FALLBACK_MODELS=["google/gemma-4-31b-it:free","nvidia/nemotron-3-super-120b-a12b:free"]
+GENERATION_MODEL=nex-agi/nex-n2.5-pro:free
+GENERATION_FALLBACK_MODELS=["nvidia/nemotron-3-super-120b-a12b:free","google/gemma-4-31b-it:free"]
 GENERATION_EXTRA_BODY={}
 ```
 
@@ -55,8 +55,8 @@ An omitted `GENERATION_FALLBACK_MODELS` means primary only. Do not put `models`
 or other managed request parameters in `GENERATION_EXTRA_BODY`.
 
 Each call uses one model, `temperature=0`, `max_tokens=8192`, and non-streaming
-JSON output. MiniMax and Gemma receive JSON object mode plus the requested schema
-in the system instruction. Nemotron Super receives native JSON Schema mode when
+JSON output. Gemma receives JSON object mode plus the requested schema
+in the system instruction. Nex-N2.5-Pro and Nemotron Super receive native JSON Schema mode when
 requested. Python validates complete output, JSON and the supplied schema before
 returning success. Invalid output gets one regeneration on the same model, then
 the next model; transport failures go directly to the next model. Refusals,
@@ -164,7 +164,7 @@ provider and actual model used:
 ```json
 {
   "provider": "remote",
-  "model": "minimax/minimax-m3:free",
+  "model": "nex-agi/nex-n2.5-pro:free",
   "response": "{\"supported\":true}",
   "done": true,
   "model_index": 0,

@@ -8,18 +8,20 @@ import pytest
 from app import generation, limits
 from app.generation import (
     GenerationConfigurationError,
+    GenerationConfigChangedError,
     GenerationInvalidResponseError,
     GenerationRateLimitError,
     GenerationRequestError,
     GenerationUnavailableError,
     generate_text,
+    generation_catalog,
     select_generation_provider,
 )
 from app.settings import Settings
 
 
-MODELS = ["minimax/minimax-m3:free", "google/gemma-4-31b-it:free",
-          "nvidia/nemotron-3-super-120b-a12b:free"]
+MODELS = ["nex-agi/nex-n2.5-pro:free", "nvidia/nemotron-3-super-120b-a12b:free",
+          "google/gemma-4-31b-it:free"]
 REMOTE_SETTINGS = Settings(
     generation_provider="remote",
     generation_api_key="router-secret",
@@ -68,6 +70,52 @@ def chain():
     return REMOTE_SETTINGS.model_copy(update={"generation_fallback_models": MODELS[1:]})
 
 
+def test_generation_catalog_is_stable_and_contains_no_secret():
+    first = generation_catalog(chain())
+    second = generation_catalog(chain())
+    assert first == second
+    assert first["allowed_models"] == MODELS and first["default_models"] == MODELS
+    assert first["provider"] == "remote" and first["limits"]["chain_length"] == 3
+    assert len(first["catalog_fingerprint"]) == 64
+    assert "router-secret" not in json.dumps(first)
+
+
+def test_generation_catalog_changes_with_extra_body():
+    base = chain()
+    changed = base.model_copy(update={"generation_extra_body": {"provider": {"allow_fallbacks": False}}})
+    assert generation_catalog(base)["catalog_fingerprint"] != generation_catalog(changed)["catalog_fingerprint"]
+
+
+def test_request_selection_controls_actual_upstream_chain(monkeypatch):
+    settings = chain()
+    catalog = generation_catalog(settings)
+    calls = provider_responses(monkeypatch, [completion("{"), completion("{"), completion()])
+    result = asyncio.run(generate_text(
+        "", "Review", settings, model_ids=MODELS[1:],
+        catalog_fingerprint=catalog["catalog_fingerprint"],
+    ))
+    assert [call["model"] for call in calls] == [MODELS[1], MODELS[1], MODELS[2]]
+    assert result.model_index == 1 and result.catalog_fingerprint == catalog["catalog_fingerprint"]
+
+
+@pytest.mark.parametrize("models", [[], [MODELS[0], MODELS[0]], [*MODELS, "extra"], ["outside"], ["x" * 256]])
+def test_invalid_request_selection_stops_before_provider(monkeypatch, models):
+    settings = chain()
+    calls = provider_responses(monkeypatch, [])
+    with pytest.raises(GenerationRequestError):
+        asyncio.run(generate_text("", "Review", settings, model_ids=models,
+                                  catalog_fingerprint=generation_catalog(settings)["catalog_fingerprint"]))
+    assert calls == []
+
+
+def test_stale_catalog_is_terminal_before_provider(monkeypatch):
+    calls = provider_responses(monkeypatch, [])
+    with pytest.raises(GenerationConfigChangedError):
+        asyncio.run(generate_text("", "Review", chain(), model_ids=[MODELS[1]],
+                                  catalog_fingerprint="0" * 64))
+    assert calls == []
+
+
 @pytest.mark.parametrize(("configured", "api_key", "expected"), [
     ("auto", "", "ollama"), ("auto", "secret", "remote"),
     ("ollama", "secret", "ollama"), ("remote", "secret", "remote"),
@@ -108,8 +156,8 @@ def test_remote_schema_contract_and_original_instructions(monkeypatch, model):
              + json.dumps(SCHEMA["json_schema"]["schema"], ensure_ascii=False)},
             {"role": "user", "content": "Reply OK"},
         ]
-        assert payload["response_format"] == (SCHEMA if model == MODELS[2] else {"type": "json_object"})
-        assert payload.get("provider") == ({"require_parameters": True} if model == MODELS[2] else None)
+        assert payload["response_format"] == ({"type": "json_object"} if model == MODELS[2] else SCHEMA)
+        assert payload.get("provider") == (None if model == MODELS[2] else {"require_parameters": True})
         assert payload["max_tokens"] == 8192 and payload["temperature"] == 0 and payload["stream"] is False
         assert result.response == '{"ok":true}' and result.model == "actual-model"
 

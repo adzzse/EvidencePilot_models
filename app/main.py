@@ -16,12 +16,14 @@ from app.extraction import (
 )
 from app.generation import (
     GenerationConfigurationError,
+    GenerationConfigChangedError,
     GenerationError,
     GenerationInvalidResponseError,
     GenerationRateLimitError,
     GenerationRequestError,
     GenerationUnavailableError,
     generate_text,
+    generation_catalog,
     select_generation_provider,
 )
 from app.models import (
@@ -129,6 +131,11 @@ async def extract_document(
     )
 
 
+@app.get("/ai/generation-config", dependencies=[Depends(require_api_key)])
+async def generation_config(settings: Settings = Depends(get_settings)) -> dict:
+    return generation_catalog(settings)
+
+
 @app.post("/ai/generate", response_model=GenerateResponse, dependencies=[Depends(require_api_key)])
 async def generate(
     payload: GenerateRequest,
@@ -139,11 +146,14 @@ async def generate(
         if payload.response_format
         else None
     )
-    return await generate_text(
+    result = await generate_text(
         payload.system, payload.prompt, settings, response_format,
         model_index=payload.model_index, attempt=payload.attempt,
         budget_ms=payload.budget_ms, validation_feedback=payload.validation_feedback,
+        **({"model_ids": payload.model_ids, "catalog_fingerprint": payload.catalog_fingerprint}
+           if payload.model_ids is not None else {}),
     )
+    return JSONResponse(result.model_dump(exclude={"catalog_fingerprint"} if payload.model_ids is None else set()))
 
 
 @app.post("/ai/embeddings", response_model=EmbeddingResponse, dependencies=[Depends(require_api_key)])
@@ -184,6 +194,11 @@ async def unavailable_handler(_, exc: RuntimeError):
 @app.exception_handler(GenerationRateLimitError)
 async def rate_limit_handler(_, exc: GenerationRateLimitError):
     return _error_response(429, exc)
+
+
+@app.exception_handler(GenerationConfigChangedError)
+async def generation_config_changed_handler(_, exc: GenerationConfigChangedError):
+    return _error_response(409, exc)
 
 
 @app.exception_handler(OllamaInvalidResponseError)

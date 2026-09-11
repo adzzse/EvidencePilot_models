@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -7,7 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
@@ -51,6 +52,10 @@ class GenerationConfigurationError(GenerationError):
 
 class GenerationRequestError(GenerationError):
     code = "INVALID_GENERATION_REQUEST"
+
+
+class GenerationConfigChangedError(GenerationError):
+    code = "GENERATION_CONFIG_CHANGED"
 
 
 class GenerationUnavailableError(GenerationError):
@@ -313,11 +318,56 @@ def select_generation_provider(settings: Settings) -> GenerationProvider:
     raise GenerationConfigurationError("GENERATION_PROVIDER must be auto, ollama, or remote")
 
 
+def generation_catalog(settings: Settings) -> dict[str, Any]:
+    provider = select_generation_provider(settings)
+    models = ([settings.generation_model, *settings.generation_fallback_models]
+              if provider.name == "remote" else [settings.ollama_model])
+    endpoint = settings.generation_base_url if provider.name == "remote" else settings.ollama_base_url
+    parsed = urlsplit(endpoint)
+    normalized_endpoint = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(),
+                                      parsed.path.rstrip("/"), "", ""))
+    canonical = {
+        "protocol_version": 1,
+        "provider": provider.name,
+        "endpoint": normalized_endpoint,
+        "allowed_models": models,
+        "generation": {"max_tokens": 8192, "temperature": 0, "stream": False,
+                       "attempts_per_model": 2, "extra_body": settings.generation_extra_body},
+    }
+    fingerprint = hashlib.sha256(json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    return {
+        "protocol_version": 1,
+        "provider": provider.name,
+        "allowed_models": models,
+        "default_models": models,
+        "catalog_fingerprint": fingerprint,
+        "limits": {"system_chars": 8000, "prompt_chars": 48000, "chain_length": 3},
+    }
+
+
+def resolve_model_chain(settings: Settings, model_ids: list[str] | None,
+                        catalog_fingerprint: str | None) -> tuple[list[str], str | None]:
+    catalog = generation_catalog(settings)
+    if model_ids is None:
+        return catalog["default_models"], None
+    if catalog_fingerprint != catalog["catalog_fingerprint"]:
+        raise GenerationConfigChangedError(
+            "Generation configuration changed; reload before retrying", terminal=True
+        )
+    if any(model not in catalog["allowed_models"] for model in model_ids):
+        raise GenerationRequestError("model_ids contains a model outside the configured allowlist")
+    return model_ids, catalog_fingerprint
+
+
 async def generate_text(
     system: str, prompt: str, settings: Settings,
     response_format: dict[str, Any] | None = None, *,
     model_index: int = 0, attempt: int = 1, budget_ms: int = 300000,
     validation_feedback: str | None = None,
+    model_ids: list[str] | None = None,
+    catalog_fingerprint: str | None = None,
     validate: Callable[[str], Any] | None = None,
 ) -> GenerateResponse:
     loop = asyncio.get_running_loop()
@@ -326,14 +376,16 @@ async def generate_text(
     try:
         request = GenerateRequest(system=system, prompt=prompt, response_format=response_format,
                                   model_index=model_index, attempt=attempt, budget_ms=budget_ms,
-                                  validation_feedback=validation_feedback)
+                                  validation_feedback=validation_feedback, model_ids=model_ids,
+                                  catalog_fingerprint=catalog_fingerprint)
     except ValueError as exc:
         raise GenerationRequestError("Invalid generation request") from exc
     deadline = started + request.budget_ms / 1000
     validator = _output_validator(response_format)
     provider = select_generation_provider(settings)
-    models = ([settings.generation_model, *settings.generation_fallback_models]
-              if provider.name == "remote" else [settings.ollama_model])
+    models, selection_fingerprint = resolve_model_chain(
+        settings, request.model_ids, request.catalog_fingerprint
+    )
     if model_index >= len(models):
         raise GenerationRequestError("model_index is outside the configured generation chain")
     try:
@@ -367,7 +419,8 @@ async def generate_text(
                             raise TimeoutError
                         return result.model_copy(update={"response": output, "model_index": index,
                                                         "attempt": current_attempt,
-                                                        "next_model_index": index + 1 if index + 1 < len(models) else None})
+                                                        "next_model_index": index + 1 if index + 1 < len(models) else None,
+                                                        "catalog_fingerprint": selection_fingerprint})
                     except (GenerationInvalidResponseError, OllamaInvalidResponseError) as exc:
                         if isinstance(exc, GenerationError) and exc.terminal:
                             raise
