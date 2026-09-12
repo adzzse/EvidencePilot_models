@@ -319,8 +319,8 @@ def _normalize_mineru_blocks(content_list: list[dict[str, Any]]) -> list[Extract
                 ))
             continue
 
-        if item_type in {"image", "figure"}:
-            caption = _caption(item, "image_caption")
+        if item_type in {"image", "figure", "chart"}:
+            caption = _caption(item, "chart_caption" if item_type == "chart" else "image_caption")
             image_path = _mineru_image_path(item)
             if image_path:
                 blocks.append(ExtractionBlock("image", image_path, caption=caption))

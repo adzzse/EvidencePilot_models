@@ -799,7 +799,12 @@ def test_mineru_keeps_flat_levels_when_hierarchy_is_invalid(monkeypatch):
     assert enriched is product
 
 
-def test_mineru_bundle_includes_referenced_image(tmp_path):
+@pytest.mark.parametrize("item_type,caption_key", [
+    ("image", "image_caption"),
+    ("figure", "image_caption"),
+    ("chart", "chart_caption"),
+])
+def test_mineru_bundle_includes_referenced_image(tmp_path, item_type, caption_key):
     output_dir = tmp_path / "output"
     document_dir = output_dir / "paper"
     image_path = document_dir / "images" / "figure.jpg"
@@ -813,10 +818,11 @@ def test_mineru_bundle_includes_referenced_image(tmp_path):
         json.dumps([
             {"type": "text", "text": "Result", "text_level": 1},
             {
-                "type": "image",
+                "type": item_type,
                 "img_path": "images/figure.jpg",
-                "image_caption": ["Figure 3. Architecture"],
+                caption_key: ["Figure 3. Architecture"],
             },
+            {"type": "text", "text": "Following paragraph"},
         ]),
         encoding="utf-8",
     )
@@ -826,6 +832,7 @@ def test_mineru_bundle_includes_referenced_image(tmp_path):
     assert [(block.type, block.text, block.caption) for block in product.document.blocks] == [
         ("heading", "Result", None),
         ("image", "images/figure.jpg", "Figure 3. Architecture"),
+        ("paragraph", "Following paragraph", None),
     ]
     assert product.document.images == ("images/figure.jpg",)
     assert product.image_files == (("images/figure.jpg", image_path),)
