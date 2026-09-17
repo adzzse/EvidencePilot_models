@@ -25,6 +25,8 @@ def test_builds_default_uvicorn_and_ngrok_commands():
         "ngrok",
         "http",
         "http://127.0.0.1:8000",
+        "--url",
+        "https://wren-fun-hyena.ngrok-free.app",
     ]
 
 

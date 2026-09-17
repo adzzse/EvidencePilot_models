@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+NGROK_ENDPOINT_URL = "https://wren-fun-hyena.ngrok-free.app"
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,13 @@ def uvicorn_command(config: TunnelConfig, python_executable: str = sys.executabl
 
 
 def ngrok_tunnel_command(config: TunnelConfig, ngrok_executable: str) -> list[str]:
-    return [ngrok_executable, "http", _local_url(config)]
+    return [
+        ngrok_executable,
+        "http",
+        _local_url(config),
+        "--url",
+        NGROK_ENDPOINT_URL,
+    ]
 
 
 def ngrok_auth_command(authtoken: str, ngrok_executable: str) -> list[str]:
