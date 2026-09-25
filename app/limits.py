@@ -5,7 +5,8 @@ from app.settings import load_settings
 
 
 class ModelCallGate:
-    # ponytail: process-local; add a distributed limiter before multiple Python workers.
+    # The service runs one worker, so these process-local pools are the active
+    # concurrency boundary. A multi-worker deployment needs a shared limiter.
     def __init__(self, max_concurrent: int, min_interval_ms: int = 0):
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._pace_lock = asyncio.Lock()

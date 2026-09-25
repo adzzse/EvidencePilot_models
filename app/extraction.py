@@ -622,7 +622,8 @@ def _read_docx(path: Path, max_uncompressed_bytes: int) -> ExtractedDocument:
     except Exception as exc:
         raise ExtractionError("DOCX file is invalid") from exc
 
-    # ponytail: text/table extraction only; add image OCR if retrieval evaluation needs it.
+    # DOCX extraction currently preserves text and tables; image OCR belongs to
+    # a future retrieval requirement and is intentionally outside this contract.
     parts: list[str] = []
     for item in document.iter_inner_content():
         if isinstance(item, DocxParagraph):
