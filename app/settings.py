@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class Settings(BaseModel):
     generation_provider: str = "remote"
     generation_api_key: str = ""
+    generation_api_keys: tuple[str, ...] = ()
     generation_base_url: str = ""
     generation_model: str = ""
     generation_fallback_models: list[str] = Field(default_factory=list, max_length=2)
@@ -29,6 +30,17 @@ class Settings(BaseModel):
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
+        raw_keys = os.getenv("GENERATION_API_KEYS", "").strip()
+        if raw_keys and os.getenv("GENERATION_API_KEY", "").strip():
+            raise ValueError("Configure GENERATION_API_KEY or GENERATION_API_KEYS, not both")
+        try:
+            generation_api_keys = json.loads(raw_keys) if raw_keys else []
+        except ValueError as exc:
+            raise ValueError("GENERATION_API_KEYS must be a JSON array of keys") from exc
+        if not isinstance(generation_api_keys, list) or any(
+            not isinstance(key, str) for key in generation_api_keys
+        ):
+            raise ValueError("GENERATION_API_KEYS must be a JSON array of keys")
         hosts = tuple(
             host.strip().lower()
             for host in os.getenv("EXTRACTION_ALLOWED_HOSTS", "").split(",")
@@ -37,6 +49,7 @@ class Settings(BaseModel):
         return cls(
             generation_provider=os.getenv("GENERATION_PROVIDER", "remote").strip().lower(),
             generation_api_key=os.getenv("GENERATION_API_KEY", "").strip(),
+            generation_api_keys=tuple(generation_api_keys),
             generation_base_url=os.getenv("GENERATION_BASE_URL", "")
             .strip()
             .rstrip("/"),

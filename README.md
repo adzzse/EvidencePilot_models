@@ -37,27 +37,50 @@ Pull the local embedding model:
 ollama pull nomic-embed-text
 ```
 
-Configure the OpenRouter generation chain:
+Configure OpenRouter model choices:
 
 ```dotenv
 GENERATION_PROVIDER=remote
 GENERATION_API_KEY=
 GENERATION_BASE_URL=https://openrouter.ai/api/v1
-GENERATION_MODEL=nex-agi/nex-n2.5-pro:free
-GENERATION_FALLBACK_MODELS=["nvidia/nemotron-3-super-120b-a12b:free","google/gemma-4-31b-it:free"]
+GENERATION_MODEL=
+GENERATION_FALLBACK_MODELS=[]
 GENERATION_EXTRA_BODY={}
 ```
+
+With both model fields empty, the Python service fetches each configured key's
+OpenRouter `/models/user` catalog and offers their common, compatible free
+text models in the existing Admin model selector. Admins select one primary and
+up to two fallbacks; the service does not choose a new saved selection silently.
+It requires zero-price `:free` variants with `response_format` support and
+enough context/output tokens for this service's request cap. The catalog is
+cached for five minutes; a transient fetch failure can reuse a successful
+snapshot for up to one hour. An absent selected model requires the admin to
+reload and choose again. Catalog metadata does not prove current inference
+availability or remaining quota. Preview variants remain selectable but are
+not placed in the default chain when stable variants exist. For a non-OpenRouter gateway, set
+`GENERATION_MODEL` and optionally `GENERATION_FALLBACK_MODELS` explicitly.
+
+For optional OpenRouter key failover, leave `GENERATION_API_KEY` empty and set
+`GENERATION_API_KEYS` to a JSON array of one to three distinct keys in local
+secret configuration. The two settings cannot be used together. The service
+keeps using the active key until an identifiable OpenRouter platform 429, then
+tries the same model request with the next available key inside the existing
+deadline. Upstream 429s still follow model fallback; unknown 429s stop. Key
+state is process-local. [OpenRouter says](https://openrouter.ai/docs/api_reference/limits)
+extra accounts or keys do not guarantee more capacity, and switching keys can
+reduce [response-cache hits](https://openrouter.ai/docs/guides/features/response-caching).
 
 Remote is the default and missing credentials fail explicitly. Local LLM
 generation is disabled in this setup; the legacy `ollama` and `auto` modes remain
 available only through explicit configuration. They are never remote fallbacks.
-An omitted `GENERATION_FALLBACK_MODELS` means primary only. Do not put `models`
+In fixed-model mode, an omitted `GENERATION_FALLBACK_MODELS` means primary only. Do not put `models`
 or other managed request parameters in `GENERATION_EXTRA_BODY`.
 
 Each call uses one model, `temperature=0`, `max_tokens=8192`, and non-streaming
-JSON output. Gemma receives JSON object mode plus the requested schema
-in the system instruction. Nex-N2.5-Pro and Nemotron Super receive native JSON Schema mode when
-requested. Python validates complete output, JSON and the supplied schema before
+JSON output. Catalog models advertising `structured_outputs` receive native
+JSON Schema mode when requested; other eligible models receive JSON object mode
+plus the requested schema in the system instruction. Python validates complete output, JSON and the supplied schema before
 returning success. Invalid output gets one regeneration on the same model, then
 the next model; transport failures go directly to the next model. Refusals,
 request/authentication errors, and shared or ambiguous quota limits stop the call.
@@ -80,7 +103,7 @@ hostname must be reachable from this machine, so a Railway-private hostname is
 not suitable for the presigned download URL.
 
 `MODEL_API_KEY` authenticates Java requests to this worker. It is unrelated to
-`GENERATION_API_KEY`.
+`GENERATION_API_KEY` and `GENERATION_API_KEYS`.
 
 Run one Python worker: `MODEL_MAX_CONCURRENT_REQUESTS` caps each of two independent
 process-local pools, remote generation and local extraction/embedding.
@@ -102,7 +125,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 `GET /health` is public. Every `POST` route requires `X-API-Key`.
-Remote health checks catalog coverage for the configured chain; it does not prove
+Remote health checks catalog coverage for the configured or discovered models; it does not prove
 inference availability or remaining quota (`inference_verified=false`). Local
 generation availability is not required or advertised in remote mode.
 

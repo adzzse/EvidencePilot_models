@@ -13,6 +13,7 @@ from docx import Document as WordDocument
 from fastapi.testclient import TestClient
 
 import app.extraction as extraction
+import app.generation as generation
 import app.main as main
 from app import limits
 from app.extraction import (
@@ -160,6 +161,64 @@ def test_generation_config_is_authenticated_and_contains_no_secret(client):
     assert response.status_code == 200
     assert response.json()["allowed_models"] == ["model-a", "model-b"]
     assert "provider-secret" not in response.text
+
+
+def test_generation_config_exposes_dynamic_openrouter_choices(client, monkeypatch):
+    from app.openrouter_catalog import CatalogSnapshot
+
+    models = tuple(f"provider/model-{index}:free" for index in range(5))
+    snapshot = CatalogSnapshot(models, frozenset(models), models[:3])
+    monkeypatch.setattr(generation.openrouter_catalog, "get_catalog", lambda *_: snapshot)
+    settings = SETTINGS.model_copy(update={
+        "generation_provider": "remote", "generation_api_key": "provider-secret",
+        "generation_base_url": "https://openrouter.ai/api/v1",
+        "generation_model": "", "generation_fallback_models": [],
+    })
+    main.app.dependency_overrides[main.get_settings] = lambda: settings
+
+    response = client.get("/ai/generation-config", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["allowed_models"] == list(models)
+    assert response.json()["default_models"] == list(models[:3])
+    assert "provider-secret" not in response.text
+
+
+def test_dynamic_catalog_selection_reaches_provider_through_public_api(client, monkeypatch):
+    from app.openrouter_catalog import CatalogSnapshot
+
+    models = tuple(f"provider/model-{index}:free" for index in range(5))
+    snapshot = CatalogSnapshot(models, frozenset(models), models[:3])
+    monkeypatch.setattr(generation.openrouter_catalog, "get_catalog", lambda *_: snapshot)
+    settings = SETTINGS.model_copy(update={
+        "generation_provider": "remote", "generation_api_key": "provider-secret",
+        "generation_base_url": "https://openrouter.ai/api/v1",
+        "generation_model": "", "generation_fallback_models": [],
+    })
+    main.app.dependency_overrides[main.get_settings] = lambda: settings
+    real_client = httpx.AsyncClient
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "model": models[4],
+            "choices": [{"finish_reason": "stop", "message": {"content": '{"ok":true}'}}],
+        })
+
+    monkeypatch.setattr(generation.httpx, "AsyncClient",
+                        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs))
+    catalog = client.get("/ai/generation-config", headers=HEADERS).json()
+    response = client.post("/ai/generate", headers=HEADERS, json={
+        "prompt": "Review", "model_ids": [models[4]],
+        "catalog_fingerprint": catalog["catalog_fingerprint"],
+        "budget_ms": 30000,
+    })
+
+    assert response.status_code == 200
+    assert response.json()["model_index"] == 0
+    assert response.json()["catalog_fingerprint"] == catalog["catalog_fingerprint"]
+    assert [call["model"] for call in calls] == [models[4]]
 
 
 def test_generation_config_requires_server_key(client):
@@ -892,6 +951,7 @@ def test_settings_reads_mineru_command(monkeypatch):
 def test_settings_reads_generation_provider_configuration(monkeypatch):
     monkeypatch.setenv("GENERATION_PROVIDER", "remote")
     monkeypatch.setenv("GENERATION_API_KEY", "router-secret")
+    monkeypatch.setenv("GENERATION_API_KEYS", "")
     monkeypatch.setenv(
         "GENERATION_BASE_URL",
         "https://gateway.test/v1/",
@@ -915,6 +975,29 @@ def test_settings_reads_generation_provider_configuration(monkeypatch):
         "reasoning": {"effort": "none"}
     }
     assert settings.ollama_model == "qwen3.5:9b"
+
+
+def test_settings_reads_openrouter_key_list_without_echoing_values(monkeypatch):
+    monkeypatch.setenv("GENERATION_API_KEY", "")
+    monkeypatch.setenv("GENERATION_API_KEYS", '["key-a","key-b","key-c"]')
+    monkeypatch.setenv("GENERATION_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("GENERATION_MODEL", "nex-agi/nex-n2.5-pro:free")
+    settings = Settings.from_env()
+    assert settings.generation_api_keys == ("key-a", "key-b", "key-c")
+    assert main.generation_catalog(settings)["provider"] == "remote"
+    assert "key-a" not in json.dumps(main.generation_catalog(settings))
+
+
+def test_settings_rejects_ambiguous_or_invalid_key_list(monkeypatch):
+    monkeypatch.setenv("GENERATION_API_KEY", "legacy-secret")
+    monkeypatch.setenv("GENERATION_API_KEYS", '["key-a"]')
+    with pytest.raises(ValueError, match="not both"):
+        Settings.from_env()
+    monkeypatch.setenv("GENERATION_API_KEY", "")
+    monkeypatch.setenv("GENERATION_API_KEYS", "not-json")
+    with pytest.raises(ValueError, match="JSON array") as failure:
+        Settings.from_env()
+    assert "legacy-secret" not in str(failure.value)
 
 
 def test_generate_continuation_contract(client, monkeypatch):

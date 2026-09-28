@@ -18,6 +18,7 @@ from app.generation import (
     select_generation_provider,
 )
 from app.settings import Settings
+from app.openrouter_catalog import CatalogSnapshot
 
 
 MODELS = ["nex-agi/nex-n2.5-pro:free", "nvidia/nemotron-3-super-120b-a12b:free",
@@ -42,6 +43,7 @@ SCHEMA = {
 def isolated_gates(monkeypatch):
     monkeypatch.setattr(limits, "generation_gate", limits.ModelCallGate(4))
     monkeypatch.setattr(limits, "local_gate", limits.ModelCallGate(4))
+    generation.get_openrouter_key_pool.cache_clear()
 
 
 def completion(text='{"ok":true}', finish="stop", **message):
@@ -49,13 +51,16 @@ def completion(text='{"ok":true}', finish="stop", **message):
             "choices": [{"finish_reason": finish, "message": {"content": text, **message}}]}
 
 
-def provider_responses(monkeypatch, responses):
+def provider_responses(monkeypatch, responses, requests=None):
     calls = []
     responses = iter(responses)
     real_client = httpx.AsyncClient
 
     async def respond(request):
-        calls.append(json.loads(request.content))
+        if requests is not None:
+            requests.append(request)
+        if request.method == "POST":
+            calls.append(json.loads(request.content))
         result = next(responses)
         if isinstance(result, Exception):
             raise result
@@ -68,6 +73,27 @@ def provider_responses(monkeypatch, responses):
 
 def chain():
     return REMOTE_SETTINGS.model_copy(update={"generation_fallback_models": MODELS[1:]})
+
+
+def rotated():
+    return REMOTE_SETTINGS.model_copy(update={
+        "generation_api_key": "", "generation_api_keys": ("key-a", "key-b", "key-c"),
+    })
+
+
+def dynamic():
+    return rotated().model_copy(update={"generation_model": "", "generation_fallback_models": []})
+
+
+def platform_429(*, retry_after="0.02"):
+    return httpx.Response(429, headers={"X-RateLimit-Limit": "20", "X-RateLimit-Remaining": "0",
+                                        "Retry-After": retry_after},
+                          json={"error": {"code": 429,
+                                          "metadata": {"error_type": "rate_limit_exceeded"}}})
+
+
+def key_status(remaining=10):
+    return httpx.Response(200, json={"data": {"free_model_daily_requests": {"remaining": remaining}}})
 
 
 def test_generation_catalog_is_stable_and_contains_no_secret():
@@ -84,6 +110,83 @@ def test_generation_catalog_changes_with_extra_body():
     base = chain()
     changed = base.model_copy(update={"generation_extra_body": {"provider": {"allow_fallbacks": False}}})
     assert generation_catalog(base)["catalog_fingerprint"] != generation_catalog(changed)["catalog_fingerprint"]
+
+
+def test_multiple_keys_keep_catalog_stable_and_secret_free():
+    first = generation_catalog(rotated())
+    reversed_keys = rotated().model_copy(update={"generation_api_keys": tuple(reversed(rotated().generation_api_keys))})
+    second = generation_catalog(reversed_keys)
+    assert first == second
+    assert all(key not in json.dumps(first) for key in ("key-a", "key-b", "key-c"))
+    assert select_generation_provider(rotated()).name == "remote"
+
+
+def test_dynamic_catalog_accepts_a_model_beyond_the_first_three(monkeypatch):
+    models = tuple(f"provider/model-{index}:free" for index in range(5))
+    snapshot = CatalogSnapshot(models, frozenset(models[:4]), models[:3])
+    monkeypatch.setattr(generation.openrouter_catalog, "get_catalog", lambda *_: snapshot)
+    settings = dynamic()
+    catalog = generation_catalog(settings)
+    assert catalog["allowed_models"] == list(models)
+    assert catalog["default_models"] == list(models[:3])
+    calls = provider_responses(monkeypatch, [completion()])
+
+    result = asyncio.run(generate_text(
+        "", "Review", settings, SCHEMA, model_ids=[models[4]],
+        catalog_fingerprint=catalog["catalog_fingerprint"],
+    ))
+
+    assert result.done and result.catalog_fingerprint == catalog["catalog_fingerprint"]
+    assert [call["model"] for call in calls] == [models[4]]
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert calls[0]["provider"]["require_parameters"] is True
+
+
+def test_dynamic_catalog_addition_keeps_fingerprint_but_removed_selection_stops(monkeypatch):
+    models = ("provider/first:free", "provider/second:free")
+    current = [CatalogSnapshot(models, frozenset(models), models)]
+    monkeypatch.setattr(generation.openrouter_catalog, "get_catalog", lambda *_: current[0])
+    settings = dynamic()
+    fingerprint = generation_catalog(settings)["catalog_fingerprint"]
+    current[0] = CatalogSnapshot((*models, "provider/third:free"),
+                                 frozenset((*models, "provider/third:free")), models)
+    assert generation_catalog(settings)["catalog_fingerprint"] == fingerprint
+    current[0] = CatalogSnapshot((models[0],), frozenset((models[0],)), (models[0],))
+    calls = provider_responses(monkeypatch, [])
+    with pytest.raises(GenerationConfigChangedError):
+        asyncio.run(generate_text("", "Review", settings, model_ids=[models[1]],
+                                  catalog_fingerprint=fingerprint))
+    assert calls == []
+
+
+def test_explicit_ollama_does_not_fetch_openrouter_catalog(monkeypatch):
+    from app.models import GenerateResponse
+
+    settings = dynamic().model_copy(update={"generation_provider": "ollama"})
+    monkeypatch.setattr(generation.openrouter_catalog, "get_catalog",
+                        lambda *_: pytest.fail("Explicit Ollama mode must not fetch OpenRouter catalog"))
+
+    async def local(*_):
+        return GenerateResponse(provider="ollama", model="local", response="{}", done=True)
+
+    monkeypatch.setattr(generation, "generate_with_ollama", local)
+    assert generation_catalog(settings)["provider"] == "ollama"
+    assert asyncio.run(generate_text("", "Review", settings)).response == "{}"
+
+
+@pytest.mark.parametrize("keys", [(), ("key-a", ""), ("key-a", "key-a"),
+                                   ("a", "b", "c", "d")])
+def test_invalid_key_lists_stop_before_provider(keys):
+    settings = rotated().model_copy(update={"generation_api_keys": keys})
+    with pytest.raises(GenerationConfigurationError):
+        select_generation_provider(settings)
+
+
+def test_ambiguous_keys_and_non_openrouter_rotation_are_rejected():
+    with pytest.raises(GenerationConfigurationError):
+        select_generation_provider(rotated().model_copy(update={"generation_api_key": "legacy"}))
+    with pytest.raises(GenerationConfigurationError):
+        select_generation_provider(rotated().model_copy(update={"generation_base_url": "https://gateway.test/v1"}))
 
 
 def test_request_selection_controls_actual_upstream_chain(monkeypatch):
@@ -302,6 +405,145 @@ def test_account_or_request_errors_are_terminal_with_safe_messages(monkeypatch, 
     assert len(calls) == 1
     assert "router-secret" not in str(failure.value) + caplog.text
     assert "private-body" not in str(failure.value) + caplog.text
+
+
+def test_platform_429_changes_key_and_keeps_model_and_attempt(monkeypatch):
+    requests = []
+    calls = provider_responses(monkeypatch, [platform_429(), key_status(), completion(), completion()], requests)
+    first = asyncio.run(generate_text("", "Review", rotated()))
+    second = asyncio.run(generate_text("", "Review", rotated()))
+    inference = [request for request in requests if request.method == "POST"]
+    assert [request.headers["Authorization"] for request in inference] == [
+        "Bearer key-a", "Bearer key-b", "Bearer key-b",
+    ]
+    assert calls[0] == calls[1] == calls[2]
+    assert (first.model_index, first.attempt, second.model_index) == (0, 1, 0)
+    assert [request.method for request in requests] == ["POST", "GET", "POST", "POST"]
+
+
+def test_all_platform_limited_keys_stop_after_one_call_each(monkeypatch, caplog):
+    requests = []
+    calls = provider_responses(monkeypatch,
+                               [platform_429(), key_status(), platform_429(), key_status(),
+                                platform_429(), key_status()], requests)
+    with pytest.raises(GenerationRateLimitError) as failure:
+        asyncio.run(generate_text("", "Review", rotated()))
+    assert len(calls) == 3
+    assert [request.headers["Authorization"] for request in requests if request.method == "POST"] == [
+        "Bearer key-a", "Bearer key-b", "Bearer key-c",
+    ]
+    assert "key-a" not in caplog.text + str(failure.value)
+    assert failure.value.terminal
+
+
+def test_platform_429_in_http_200_error_envelope_can_change_key(monkeypatch):
+    requests = []
+    response = platform_429()
+    envelope = httpx.Response(200, headers=response.headers, json=response.json())
+    calls = provider_responses(monkeypatch, [envelope, key_status(), completion()], requests)
+    result = asyncio.run(generate_text("", "Review", rotated()))
+    assert result.done and len(calls) == 2
+    assert [request.headers["Authorization"] for request in requests if request.method == "POST"] == [
+        "Bearer key-a", "Bearer key-b",
+    ]
+
+
+def test_daily_exhaustion_cools_key_until_next_utc_day(monkeypatch):
+    from datetime import datetime, timezone
+
+    class Midday(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(generation, "datetime", Midday)
+    provider_responses(monkeypatch, [platform_429(), key_status(0), completion()])
+    assert asyncio.run(generate_text("", "Review", rotated())).done
+    pool = generation.get_openrouter_key_pool(rotated().generation_api_keys)
+    assert 43190 < pool.cooldowns[0] - time.monotonic() <= 43200
+    assert pool.select({1, 2}) is None
+    pool.cooldowns[0] = time.monotonic() - 1
+    assert pool.select({1, 2}) == (0, "key-a")
+
+
+def test_key_status_failure_uses_retry_after_and_does_not_log_keys(monkeypatch, caplog):
+    requests = []
+    calls = provider_responses(monkeypatch, [platform_429(retry_after="12"),
+                                           httpx.ConnectError("private-status-error"), completion()], requests)
+    assert asyncio.run(generate_text("", "Review", rotated())).done
+    pool = generation.get_openrouter_key_pool(rotated().generation_api_keys)
+    assert 11 < pool.cooldowns[0] - time.monotonic() <= 12
+    assert len(calls) == 2
+    assert "key-a" not in caplog.text and "private-status-error" not in caplog.text
+
+
+def test_second_request_avoids_key_while_first_checks_quota(monkeypatch):
+    requests = []
+    get_started = asyncio.Event()
+    release_get = asyncio.Event()
+    real_client = httpx.AsyncClient
+
+    async def respond(request):
+        requests.append(request)
+        if request.method == "GET":
+            get_started.set()
+            await release_get.wait()
+            return key_status()
+        if request.headers["Authorization"] == "Bearer key-a":
+            return platform_429(retry_after="60")
+        return httpx.Response(200, json=completion())
+
+    monkeypatch.setattr(generation.httpx, "AsyncClient",
+                        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs))
+
+    async def exercise():
+        first = asyncio.create_task(generate_text("", "Review", rotated()))
+        await get_started.wait()
+        try:
+            second = await asyncio.wait_for(generate_text("", "Review", rotated()), 0.3)
+        finally:
+            release_get.set()
+        return await first, second
+
+    first, second = asyncio.run(exercise())
+    assert first.done and second.done
+    assert [request.headers["Authorization"] for request in requests if request.method == "POST"] == [
+        "Bearer key-a", "Bearer key-b", "Bearer key-b",
+    ]
+
+
+def test_key_switch_waits_stay_inside_remote_attempt_timeout(monkeypatch):
+    calls = provider_responses(monkeypatch, [platform_429(), key_status()])
+    monkeypatch.setattr(limits, "generation_gate", limits.ModelCallGate(4, min_interval_ms=50))
+    monkeypatch.setattr(generation, "ATTEMPT_TIMEOUT_SECONDS", 0.02)
+    with pytest.raises(GenerationUnavailableError):
+        asyncio.run(generate_text("", "Review", rotated(), budget_ms=1000))
+    assert len(calls) == 1
+
+
+def test_upstream_429_provider_code_changes_model_without_changing_key(monkeypatch):
+    requests = []
+    calls = provider_responses(monkeypatch, [
+        httpx.Response(429, json={"error": {"code": 429, "message": "upstream daily quota",
+                                            "metadata": {"provider_code": 429}}}),
+        completion(),
+    ], requests)
+    result = asyncio.run(generate_text("", "Review", rotated().model_copy(update={
+        "generation_fallback_models": MODELS[1:],
+    })))
+    assert [call["model"] for call in calls] == MODELS[:2]
+    assert [request.headers["Authorization"] for request in requests] == ["Bearer key-a"] * 2
+    assert result.model_index == 1
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 429])
+def test_unknown_or_account_errors_do_not_change_key(monkeypatch, status):
+    requests = []
+    calls = provider_responses(monkeypatch, [httpx.Response(status)], requests)
+    with pytest.raises((GenerationInvalidResponseError, GenerationRateLimitError)):
+        asyncio.run(generate_text("", "Review", rotated()))
+    assert len(calls) == 1
+    assert requests[0].headers["Authorization"] == "Bearer key-a"
 
 
 @pytest.mark.parametrize("status", [429, 503])

@@ -4,9 +4,12 @@ import json
 import logging
 import math
 import re
+import threading
+import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 from typing import Any, Protocol
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
@@ -18,6 +21,7 @@ from referencing.exceptions import CannotDetermineSpecification, Unresolvable
 from referencing.jsonschema import DRAFT202012
 
 from app import limits
+from app import openrouter_catalog
 from app.models import GenerateRequest, GenerateResponse
 from app.ollama_client import (
     OllamaInvalidResponseError,
@@ -70,6 +74,76 @@ class GenerationInvalidResponseError(GenerationError):
     code = "INVALID_GENERATION_RESPONSE"
 
 
+def configured_generation_keys(settings: Settings) -> tuple[str, ...]:
+    keys = tuple(settings.generation_api_keys)
+    if settings.generation_api_key and keys:
+        raise GenerationConfigurationError("Configure GENERATION_API_KEY or GENERATION_API_KEYS, not both")
+    if keys:
+        if len(keys) > 3 or any(not isinstance(key, str) or not key.strip() for key in keys):
+            raise GenerationConfigurationError("Configure one to three nonempty generation API keys")
+        keys = tuple(key.strip() for key in keys)
+        if len(set(keys)) != len(keys):
+            raise GenerationConfigurationError("Generation API keys must be distinct")
+        if len(keys) > 1 and urlparse(settings.generation_base_url).hostname != "openrouter.ai":
+            raise GenerationConfigurationError("Multiple generation API keys require OpenRouter")
+    return keys or ((settings.generation_api_key,) if settings.generation_api_key else ())
+
+
+def _dynamic_openrouter(settings: Settings) -> bool:
+    return (settings.generation_provider != "ollama"
+            and urlparse(settings.generation_base_url).hostname == "openrouter.ai"
+            and not settings.generation_model and not settings.generation_fallback_models)
+
+
+def _catalog_snapshot(settings: Settings) -> openrouter_catalog.CatalogSnapshot:
+    try:
+        return openrouter_catalog.get_catalog(settings.generation_base_url,
+                                              configured_generation_keys(settings))
+    except openrouter_catalog.CatalogAuthenticationError as exc:
+        raise GenerationConfigurationError("OpenRouter model catalog access rejected") from exc
+    except openrouter_catalog.CatalogUnavailableError as exc:
+        raise GenerationUnavailableError("OpenRouter model catalog is unavailable", terminal=True) from exc
+
+
+class OpenRouterKeyPool:
+    def __init__(self, keys: tuple[str, ...]):
+        self.keys = keys
+        self.active = 0
+        self.cooldowns = [0.0] * len(keys)
+        self.pending = [0] * len(keys)
+        self.lock = threading.Lock()
+
+    def select(self, excluded: set[int]) -> tuple[int, str] | None:
+        with self.lock:
+            now = time.monotonic()
+            for offset in range(len(self.keys)):
+                index = (self.active + offset) % len(self.keys)
+                if index not in excluded and not self.pending[index] and self.cooldowns[index] <= now:
+                    self.active = index
+                    return index, self.keys[index]
+        return None
+
+    def mark_pending(self, index: int) -> None:
+        with self.lock:
+            self.pending[index] += 1
+            if self.active == index:
+                self.active = (index + 1) % len(self.keys)
+
+    def limit(self, index: int, cooldown_seconds: float) -> None:
+        with self.lock:
+            self.pending[index] -= 1
+            self.cooldowns[index] = max(self.cooldowns[index], time.monotonic() + cooldown_seconds)
+
+    def retry_after(self) -> float:
+        with self.lock:
+            return max(0.0, min(self.cooldowns) - time.monotonic())
+
+
+@lru_cache(maxsize=1)
+def get_openrouter_key_pool(keys: tuple[str, ...]) -> OpenRouterKeyPool:
+    return OpenRouterKeyPool(keys)
+
+
 class GenerationProvider(Protocol):
     name: str
 
@@ -97,12 +171,48 @@ class OllamaGenerationProvider:
 class OpenAICompatibleGenerationProvider:
     name = "remote"
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, schema_supported: bool | None = None):
         self.settings = settings
+        self.schema_supported = schema_supported
 
     @property
     def headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.settings.generation_api_key}"}
+        return {"Authorization": f"Bearer {configured_generation_keys(self.settings)[0]}"}
+
+    async def _post(self, payload: dict[str, Any]) -> tuple[httpx.Response, Any, Any]:
+        keys = configured_generation_keys(self.settings)
+        pool = get_openrouter_key_pool(keys) if len(keys) > 1 else None
+        used: set[int] = set()
+        async with asyncio.timeout(ATTEMPT_TIMEOUT_SECONDS):
+            async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT_SECONDS) as client:
+                while True:
+                    selected = pool.select(used) if pool else ((0, keys[0]) if not used else None)
+                    if selected is None:
+                        raise GenerationRateLimitError("OpenRouter keys are rate limited", terminal=True,
+                                                       retry_after=pool.retry_after() if pool else None)
+                    index, key = selected
+                    used.add(index)
+                    headers = {"Authorization": f"Bearer {key}"}
+                    async with limits.generation_gate.slot():
+                        response = await client.post(
+                            f"{self.settings.generation_base_url}/chat/completions",
+                            headers=headers, json=payload,
+                        )
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = None
+                    error = data.get("error") if isinstance(data, dict) else None
+                    if pool and _is_openrouter_platform_429(response, error):
+                        pool.mark_pending(index)
+                        cooldown = _retry_after(response.headers.get("retry-after")) or 60.0
+                        try:
+                            cooldown = await _key_cooldown(client, headers, response)
+                        finally:
+                            pool.limit(index, cooldown)
+                        logger.warning("OpenRouter key rate limited: key_slot=%s", index + 1)
+                        continue
+                    return response, data, error
 
     async def generate(self, system: str, prompt: str,
                        response_format: dict[str, Any] | None = None) -> GenerateResponse:
@@ -112,7 +222,8 @@ class OpenAICompatibleGenerationProvider:
             system += "\nReturn one JSON value matching this JSON Schema:\n" + json.dumps(
                 output_format["json_schema"]["schema"], ensure_ascii=False
             )
-            if openrouter and self.settings.generation_model in _JSON_ONLY_MODELS:
+            if openrouter and (self.schema_supported is False or
+                               self.schema_supported is None and self.settings.generation_model in _JSON_ONLY_MODELS):
                 output_format = {"type": "json_object"}
         messages = []
         if system:
@@ -127,22 +238,11 @@ class OpenAICompatibleGenerationProvider:
             "response_format": output_format,
             "stream": False,
         }
-        if openrouter and output_format["type"] == "json_schema":
+        if openrouter and (self.schema_supported is not None or output_format["type"] == "json_schema"):
             payload["provider"] = {**payload.get("provider", {}), "require_parameters": True}
         try:
             # The outer batch deadline also covers queueing, pacing, and slow response bodies.
-            async with limits.generation_gate.slot():
-                async with asyncio.timeout(ATTEMPT_TIMEOUT_SECONDS):
-                    async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT_SECONDS) as client:
-                        response = await client.post(
-                            f"{self.settings.generation_base_url}/chat/completions",
-                            headers=self.headers, json=payload,
-                        )
-            try:
-                data = response.json()
-            except ValueError:
-                data = None
-            error = data.get("error") if isinstance(data, dict) else None
+            response, data, error = await self._post(payload)
             if response.is_error or error is not None:
                 raise _provider_error(response, error)
             if not response.is_success:
@@ -170,6 +270,12 @@ class OpenAICompatibleGenerationProvider:
             raise GenerationInvalidResponseError("Provider returned an invalid generation response") from exc
 
     async def health(self) -> dict[str, Any]:
+        if _dynamic_openrouter(self.settings):
+            snapshot = await asyncio.to_thread(_catalog_snapshot, self.settings)
+            return {"ok": bool(snapshot.allowed_models), "provider": self.name,
+                    "model": snapshot.default_models[0], "models": list(snapshot.default_models),
+                    "available_models": list(snapshot.allowed_models), "check": "model_catalog",
+                    "inference_verified": False}
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(f"{self.settings.generation_base_url}/models", headers=self.headers)
@@ -190,6 +296,35 @@ class OpenAICompatibleGenerationProvider:
             raise GenerationInvalidResponseError("Provider returned an invalid model response") from exc
 
 
+def _is_openrouter_platform_429(response: httpx.Response, error: Any) -> bool:
+    error = error if isinstance(error, dict) else {}
+    metadata = error.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    code = error.get("code", response.status_code)
+    return (str(code) == "429"
+            and metadata.get("provider_code") is None
+            and not metadata.get("provider_name")
+            and any(header in response.headers for header in (
+                "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset",
+            )))
+
+
+async def _key_cooldown(client: httpx.AsyncClient, headers: dict[str, str],
+                        response: httpx.Response) -> float:
+    cooldown = _retry_after(response.headers.get("retry-after"))
+    try:
+        status = await client.get("https://openrouter.ai/api/v1/key", headers=headers, timeout=2.0)
+        if status.is_success:
+            remaining = status.json()["data"]["free_model_daily_requests"]["remaining"]
+            if isinstance(remaining, int) and not isinstance(remaining, bool) and remaining == 0:
+                now = datetime.now(timezone.utc)
+                midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                return (midnight - now).total_seconds()
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
+        pass
+    return cooldown if cooldown is not None else 60.0
+
+
 def _provider_error(response: httpx.Response, error: Any) -> GenerationError:
     error = error if isinstance(error, dict) else {}
     code = error.get("code", response.status_code)
@@ -199,13 +334,15 @@ def _provider_error(response: httpx.Response, error: Any) -> GenerationError:
     metadata = metadata if isinstance(metadata, dict) else {}
     if code == 429:
         # Unknown 429s may be shared account quota: only explicit upstream limits can fall through.
-        global_limit = any(word in message for word in ("daily", "per-day", "per day", "quota", "account", "credits"))
-        upstream = bool(metadata.get("provider_name")) or "upstream" in message or "temporarily rate-limited" in message
-        terminal = global_limit or not upstream
+        upstream = (metadata.get("provider_code") is not None or bool(metadata.get("provider_name"))
+                    or "upstream" in message or "temporarily rate-limited" in message)
+        global_limit = not upstream and any(
+            word in message for word in ("daily", "per-day", "per day", "quota", "account", "credits")
+        )
         failure = GenerationRateLimitError(
             "Provider rate limit exceeded",
             code="GENERATION_QUOTA_EXCEEDED" if global_limit else "GENERATION_RATE_LIMITED",
-            terminal=terminal,
+            terminal=not upstream,
         )
     elif code in (401, 402, 403) or (400 <= code < 500 and code not in (404, 408)):
         failure = GenerationInvalidResponseError("Generation provider rejected the request",
@@ -298,18 +435,22 @@ def _validated_output(text: str, validator) -> str:
 
 def select_generation_provider(settings: Settings) -> GenerationProvider:
     configured = settings.generation_provider
-    selected = ("remote" if settings.generation_api_key else "ollama") if configured == "auto" else configured
+    keys = configured_generation_keys(settings)
+    selected = ("remote" if keys else "ollama") if configured == "auto" else configured
     if selected == "ollama":
         return OllamaGenerationProvider(settings)
     if selected == "remote":
-        if not all((settings.generation_api_key, settings.generation_base_url, settings.generation_model)):
+        if not all((keys, settings.generation_base_url)) or not (
+            settings.generation_model or _dynamic_openrouter(settings)
+        ):
             raise GenerationConfigurationError(
-                "GENERATION_API_KEY, GENERATION_BASE_URL, and GENERATION_MODEL "
-                "are required when GENERATION_PROVIDER=remote"
+                "GENERATION_API_KEY or GENERATION_API_KEYS, GENERATION_BASE_URL, and a model "
+                "or OpenRouter catalog mode are required"
             )
-        models = [settings.generation_model, *settings.generation_fallback_models]
-        if len(models) > 3 or len(set(models)) != len(models) or any(not model.strip() for model in models):
-            raise GenerationConfigurationError("Configure one to three distinct generation models")
+        if not _dynamic_openrouter(settings):
+            models = [settings.generation_model, *settings.generation_fallback_models]
+            if len(models) > 3 or len(set(models)) != len(models) or any(not model.strip() for model in models):
+                raise GenerationConfigurationError("Configure one to three distinct generation models")
         if _RESERVED_BODY_KEYS.intersection(settings.generation_extra_body):
             raise GenerationConfigurationError("GENERATION_EXTRA_BODY conflicts with managed generation parameters")
         if not isinstance(settings.generation_extra_body.get("provider", {}), dict):
@@ -318,10 +459,18 @@ def select_generation_provider(settings: Settings) -> GenerationProvider:
     raise GenerationConfigurationError("GENERATION_PROVIDER must be auto, ollama, or remote")
 
 
-def generation_catalog(settings: Settings) -> dict[str, Any]:
+def generation_catalog(settings: Settings, *,
+                       snapshot: openrouter_catalog.CatalogSnapshot | None = None) -> dict[str, Any]:
     provider = select_generation_provider(settings)
-    models = ([settings.generation_model, *settings.generation_fallback_models]
-              if provider.name == "remote" else [settings.ollama_model])
+    dynamic = provider.name == "remote" and _dynamic_openrouter(settings)
+    if dynamic:
+        snapshot = snapshot or _catalog_snapshot(settings)
+        models = list(snapshot.allowed_models)
+        defaults = list(snapshot.default_models)
+    else:
+        models = ([settings.generation_model, *settings.generation_fallback_models]
+                  if provider.name == "remote" else [settings.ollama_model])
+        defaults = models
     endpoint = settings.generation_base_url if provider.name == "remote" else settings.ollama_base_url
     parsed = urlsplit(endpoint)
     normalized_endpoint = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(),
@@ -330,7 +479,7 @@ def generation_catalog(settings: Settings) -> dict[str, Any]:
         "protocol_version": 1,
         "provider": provider.name,
         "endpoint": normalized_endpoint,
-        "allowed_models": models,
+        "allowed_models": "openrouter-free-json-v1" if dynamic else models,
         "generation": {"max_tokens": 8192, "temperature": 0, "stream": False,
                        "attempts_per_model": 2, "extra_body": settings.generation_extra_body},
     }
@@ -341,15 +490,16 @@ def generation_catalog(settings: Settings) -> dict[str, Any]:
         "protocol_version": 1,
         "provider": provider.name,
         "allowed_models": models,
-        "default_models": models,
+        "default_models": defaults,
         "catalog_fingerprint": fingerprint,
         "limits": {"system_chars": 8000, "prompt_chars": 48000, "chain_length": 3},
     }
 
 
 def resolve_model_chain(settings: Settings, model_ids: list[str] | None,
-                        catalog_fingerprint: str | None) -> tuple[list[str], str | None]:
-    catalog = generation_catalog(settings)
+                        catalog_fingerprint: str | None,
+                        catalog: dict[str, Any] | None = None) -> tuple[list[str], str | None]:
+    catalog = catalog or generation_catalog(settings)
     if model_ids is None:
         return catalog["default_models"], None
     if catalog_fingerprint != catalog["catalog_fingerprint"]:
@@ -357,6 +507,10 @@ def resolve_model_chain(settings: Settings, model_ids: list[str] | None,
             "Generation configuration changed; reload before retrying", terminal=True
         )
     if any(model not in catalog["allowed_models"] for model in model_ids):
+        if _dynamic_openrouter(settings):
+            raise GenerationConfigChangedError(
+                "Selected model is no longer available; reload before retrying", terminal=True
+            )
         raise GenerationRequestError("model_ids contains a model outside the configured allowlist")
     return model_ids, catalog_fingerprint
 
@@ -383,8 +537,19 @@ async def generate_text(
     deadline = started + request.budget_ms / 1000
     validator = _output_validator(response_format)
     provider = select_generation_provider(settings)
+    snapshot = None
+    if _dynamic_openrouter(settings):
+        try:
+            snapshot = await asyncio.wait_for(
+                asyncio.to_thread(_catalog_snapshot, settings),
+                timeout=max(0, deadline - loop.time()),
+            )
+        except TimeoutError as exc:
+            raise GenerationUnavailableError("Generation batch deadline exceeded",
+                                             code="GENERATION_DEADLINE_EXCEEDED", terminal=True) from exc
+    catalog = generation_catalog(settings, snapshot=snapshot)
     models, selection_fingerprint = resolve_model_chain(
-        settings, request.model_ids, request.catalog_fingerprint
+        settings, request.model_ids, request.catalog_fingerprint, catalog
     )
     if model_index >= len(models):
         raise GenerationRequestError("model_index is outside the configured generation chain")
@@ -392,7 +557,10 @@ async def generate_text(
         async with asyncio.timeout_at(deadline):
             for index in range(model_index, len(models)):
                 if provider.name == "remote":
-                    provider = OpenAICompatibleGenerationProvider(settings.model_copy(update={"generation_model": models[index]}))
+                    provider = OpenAICompatibleGenerationProvider(
+                        settings.model_copy(update={"generation_model": models[index]}),
+                        schema_supported=(models[index] in snapshot.schema_models if snapshot else None),
+                    )
                 first_attempt = attempt if index == model_index else 1
                 for current_attempt in range(first_attempt, 3):
                     instruction = request.system

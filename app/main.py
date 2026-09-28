@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import os
@@ -133,7 +134,7 @@ async def extract_document(
 
 @app.get("/ai/generation-config", dependencies=[Depends(require_api_key)])
 async def generation_config(settings: Settings = Depends(get_settings)) -> dict:
-    return generation_catalog(settings)
+    return await asyncio.to_thread(generation_catalog, settings)
 
 
 @app.post("/ai/generate", response_model=GenerateResponse, dependencies=[Depends(require_api_key)])
