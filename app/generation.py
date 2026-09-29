@@ -212,6 +212,10 @@ class OpenAICompatibleGenerationProvider:
                             pool.limit(index, cooldown)
                         logger.warning("OpenRouter key rate limited: key_slot=%s", index + 1)
                         continue
+                    if pool and _is_rate_limit_response(response, error):
+                        if len(used) < len(keys):
+                            logger.warning("OpenRouter 429, trying next key: key_slot=%s", index + 1)
+                            continue
                     return response, data, error
 
     async def generate(self, system: str, prompt: str,
@@ -296,12 +300,16 @@ class OpenAICompatibleGenerationProvider:
             raise GenerationInvalidResponseError("Provider returned an invalid model response") from exc
 
 
+def _is_rate_limit_response(response: httpx.Response, error: Any) -> bool:
+    return (response.status_code == 429 or
+            isinstance(error, dict) and str(error.get("code")) == "429")
+
+
 def _is_openrouter_platform_429(response: httpx.Response, error: Any) -> bool:
     error = error if isinstance(error, dict) else {}
     metadata = error.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
-    code = error.get("code", response.status_code)
-    return (str(code) == "429"
+    return (_is_rate_limit_response(response, error)
             and metadata.get("provider_code") is None
             and not metadata.get("provider_name")
             and any(header in response.headers for header in (
@@ -327,7 +335,7 @@ async def _key_cooldown(client: httpx.AsyncClient, headers: dict[str, str],
 
 def _provider_error(response: httpx.Response, error: Any) -> GenerationError:
     error = error if isinstance(error, dict) else {}
-    code = error.get("code", response.status_code)
+    code = 429 if _is_rate_limit_response(response, error) else error.get("code", response.status_code)
     code = int(code) if str(code).isdigit() else response.status_code
     message = str(error.get("message", "")).casefold()
     metadata = error.get("metadata")

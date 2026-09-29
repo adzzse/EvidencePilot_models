@@ -236,7 +236,7 @@ Expose the local service when Java runs remotely on Railway:
 python scripts\start_ngrok_tunnel.py
 ```
 
-The reserved tunnel endpoint is `https://wren-fun-hyena.ngrok-free.app`.
+The reserved tunnel endpoint is `https://scoff-difficult-said.ngrok-free.dev`.
 The launcher pins ngrok to this domain; configure Railway's
 `AI_MODEL_BASE_URL` with that exact origin and use the same API key on both
 services.

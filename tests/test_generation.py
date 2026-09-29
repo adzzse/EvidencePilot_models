@@ -521,9 +521,13 @@ def test_key_switch_waits_stay_inside_remote_attempt_timeout(monkeypatch):
     assert len(calls) == 1
 
 
-def test_upstream_429_provider_code_changes_model_without_changing_key(monkeypatch):
+def test_upstream_429_tries_all_keys_before_next_model(monkeypatch):
     requests = []
     calls = provider_responses(monkeypatch, [
+        httpx.Response(429, json={"error": {"code": 429, "message": "upstream daily quota",
+                                            "metadata": {"provider_code": 429}}}),
+        httpx.Response(429, json={"error": {"code": 429, "message": "upstream daily quota",
+                                            "metadata": {"provider_code": 429}}}),
         httpx.Response(429, json={"error": {"code": 429, "message": "upstream daily quota",
                                             "metadata": {"provider_code": 429}}}),
         completion(),
@@ -531,12 +535,14 @@ def test_upstream_429_provider_code_changes_model_without_changing_key(monkeypat
     result = asyncio.run(generate_text("", "Review", rotated().model_copy(update={
         "generation_fallback_models": MODELS[1:],
     })))
-    assert [call["model"] for call in calls] == MODELS[:2]
-    assert [request.headers["Authorization"] for request in requests] == ["Bearer key-a"] * 2
+    assert [call["model"] for call in calls] == [MODELS[0]] * 3 + [MODELS[1]]
+    assert [request.headers["Authorization"] for request in requests] == [
+        "Bearer key-a", "Bearer key-b", "Bearer key-c", "Bearer key-c",
+    ]
     assert result.model_index == 1
 
 
-@pytest.mark.parametrize("status", [401, 402, 403, 429])
+@pytest.mark.parametrize("status", [401, 402, 403])
 def test_unknown_or_account_errors_do_not_change_key(monkeypatch, status):
     requests = []
     calls = provider_responses(monkeypatch, [httpx.Response(status)], requests)
@@ -544,6 +550,35 @@ def test_unknown_or_account_errors_do_not_change_key(monkeypatch, status):
         asyncio.run(generate_text("", "Review", rotated()))
     assert len(calls) == 1
     assert requests[0].headers["Authorization"] == "Bearer key-a"
+
+
+@pytest.mark.parametrize("envelope", [False, True])
+def test_unknown_429_uses_next_key_before_returning(monkeypatch, envelope):
+    requests = []
+    error = httpx.Response(200 if envelope else 429, json={"error": {"code": 429}})
+    calls = provider_responses(monkeypatch, [error, error, completion()], requests)
+    result = asyncio.run(generate_text("", "Review", rotated()))
+    assert result.done and result.model_index == 0 and result.attempt == 1
+    assert len(calls) == 3
+    assert [request.headers["Authorization"] for request in requests] == [
+        "Bearer key-a", "Bearer key-b", "Bearer key-c",
+    ]
+
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(429),
+    httpx.Response(429, json={"error": {"code": 503}}),
+])
+def test_unknown_429_returns_429_only_after_all_keys_fail(monkeypatch, response):
+    requests = []
+    calls = provider_responses(monkeypatch, [response] * 3, requests)
+    with pytest.raises(GenerationRateLimitError) as failure:
+        asyncio.run(generate_text("", "Review", rotated()))
+    assert failure.value.code == "GENERATION_RATE_LIMITED"
+    assert len(calls) == 3
+    assert [request.headers["Authorization"] for request in requests] == [
+        "Bearer key-a", "Bearer key-b", "Bearer key-c",
+    ]
 
 
 @pytest.mark.parametrize("status", [429, 503])
