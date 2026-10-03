@@ -40,7 +40,7 @@ def mock_catalog(monkeypatch, responses):
     return calls
 
 
-def test_catalog_intersects_three_accounts_and_filters_for_free_json(monkeypatch):
+def test_catalog_lists_all_free_models_and_marks_json_support(monkeypatch):
     keys = ("secret-a", "secret-b", "secret-c")
     common = model("provider/common:free")
     json_only = model("provider/json-only:free", schema=False)
@@ -48,17 +48,25 @@ def test_catalog_intersects_three_accounts_and_filters_for_free_json(monkeypatch
     preview = model("provider/preview-model:free")
     paid = model("provider/paid", price="1")
     plain = model("provider/plain:free", response_format=False)
+    free_without_suffix = model("provider/promo")
+    short_context = model("provider/short:free")
+    short_context["context_length"] = 8192
     calls = mock_catalog(monkeypatch, [
-        {"data": [common, json_only, missing, preview, paid, plain]},
-        {"data": [common, json_only, missing, preview]},
-        {"data": [common, json_only, preview]},
+        {"data": [common, json_only, missing, preview, paid, plain, free_without_suffix, short_context]},
+        {"data": [common, json_only, missing, preview, plain, free_without_suffix, short_context]},
+        {"data": [common, json_only, preview, plain, free_without_suffix, short_context]},
     ])
 
     snapshot = openrouter_catalog.get_catalog("https://openrouter.ai/api/v1", keys)
 
     assert snapshot.allowed_models == ("provider/common:free", "provider/json-only:free",
-                                       "provider/preview-model:free")
-    assert snapshot.schema_models == frozenset({"provider/common:free", "provider/preview-model:free"})
+                                       "provider/plain:free", "provider/preview-model:free",
+                                       "provider/promo", "provider/short:free")
+    assert snapshot.json_models == frozenset({"provider/common:free", "provider/json-only:free",
+                                              "provider/preview-model:free", "provider/promo",
+                                              "provider/short:free"})
+    assert snapshot.schema_models == frozenset({"provider/common:free", "provider/preview-model:free",
+                                                "provider/promo", "provider/short:free"})
     assert snapshot.default_models == ("provider/common:free", "provider/json-only:free")
     assert len(calls) == 3
     assert all(key not in str(snapshot) for key in keys)

@@ -4,12 +4,12 @@ import json
 import logging
 import math
 import re
-import threading
 import time
+import traceback
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from functools import lru_cache
+from itertools import product
 from typing import Any, Protocol
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
@@ -74,6 +74,42 @@ class GenerationInvalidResponseError(GenerationError):
     code = "INVALID_GENERATION_RESPONSE"
 
 
+_model_cooldowns: dict[tuple[str, str, str], tuple[float, GenerationError]] = {}
+
+
+def _cooldown_key(settings: Settings, key_index: int, model: str) -> tuple[str, str, str]:
+    key_hash = hashlib.sha256(configured_generation_keys(settings)[key_index].encode()).hexdigest()
+    return settings.generation_base_url.rstrip("/"), key_hash, model
+
+
+def _model_cooldown(settings: Settings, key_index: int, model: str) -> GenerationError | None:
+    identity = _cooldown_key(settings, key_index, model)
+    cooldown = _model_cooldowns.get(identity)
+    if cooldown is None:
+        return None
+    expires, failure = cooldown
+    remaining = expires - time.monotonic()
+    if remaining <= 0:
+        del _model_cooldowns[identity]
+        return None
+    logger.info("Generation model skipped: model=%s key_slot=%s cooldown_seconds=%.2f code=%s",
+                model, key_index + 1, remaining, failure.code)
+    return type(failure)(str(failure), code=failure.code, retry_after=remaining)
+
+
+def _cool_down_model(settings: Settings, key_index: int, model: str, failure: GenerationError) -> None:
+    duration = failure.retry_after
+    if duration is None or duration <= 0:
+        return
+    identity = _cooldown_key(settings, key_index, model)
+    expires = time.monotonic() + duration
+    current = _model_cooldowns.get(identity)
+    if current is None or expires > current[0]:
+        _model_cooldowns[identity] = (expires, type(failure)(str(failure), code=failure.code))
+    logger.warning("Generation model cooldown: model=%s key_slot=%s cooldown_seconds=%.2f code=%s",
+                   model, key_index + 1, duration, failure.code)
+
+
 def configured_generation_keys(settings: Settings) -> tuple[str, ...]:
     keys = tuple(settings.generation_api_keys)
     if settings.generation_api_key and keys:
@@ -105,45 +141,6 @@ def _catalog_snapshot(settings: Settings) -> openrouter_catalog.CatalogSnapshot:
         raise GenerationUnavailableError("OpenRouter model catalog is unavailable", terminal=True) from exc
 
 
-class OpenRouterKeyPool:
-    def __init__(self, keys: tuple[str, ...]):
-        self.keys = keys
-        self.active = 0
-        self.cooldowns = [0.0] * len(keys)
-        self.pending = [0] * len(keys)
-        self.lock = threading.Lock()
-
-    def select(self, excluded: set[int]) -> tuple[int, str] | None:
-        with self.lock:
-            now = time.monotonic()
-            for offset in range(len(self.keys)):
-                index = (self.active + offset) % len(self.keys)
-                if index not in excluded and not self.pending[index] and self.cooldowns[index] <= now:
-                    self.active = index
-                    return index, self.keys[index]
-        return None
-
-    def mark_pending(self, index: int) -> None:
-        with self.lock:
-            self.pending[index] += 1
-            if self.active == index:
-                self.active = (index + 1) % len(self.keys)
-
-    def limit(self, index: int, cooldown_seconds: float) -> None:
-        with self.lock:
-            self.pending[index] -= 1
-            self.cooldowns[index] = max(self.cooldowns[index], time.monotonic() + cooldown_seconds)
-
-    def retry_after(self) -> float:
-        with self.lock:
-            return max(0.0, min(self.cooldowns) - time.monotonic())
-
-
-@lru_cache(maxsize=1)
-def get_openrouter_key_pool(keys: tuple[str, ...]) -> OpenRouterKeyPool:
-    return OpenRouterKeyPool(keys)
-
-
 class GenerationProvider(Protocol):
     name: str
 
@@ -171,52 +168,44 @@ class OllamaGenerationProvider:
 class OpenAICompatibleGenerationProvider:
     name = "remote"
 
-    def __init__(self, settings: Settings, *, schema_supported: bool | None = None):
+    def __init__(self, settings: Settings, *, schema_supported: bool | None = None,
+                 json_supported: bool | None = None, key_index: int = 0):
         self.settings = settings
         self.schema_supported = schema_supported
+        self.json_supported = json_supported
+        self.key_index = key_index
 
     @property
     def headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {configured_generation_keys(self.settings)[0]}"}
+        return {"Authorization": f"Bearer {configured_generation_keys(self.settings)[self.key_index]}"}
 
     async def _post(self, payload: dict[str, Any]) -> tuple[httpx.Response, Any, Any]:
-        keys = configured_generation_keys(self.settings)
-        pool = get_openrouter_key_pool(keys) if len(keys) > 1 else None
-        used: set[int] = set()
-        async with asyncio.timeout(ATTEMPT_TIMEOUT_SECONDS):
-            async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT_SECONDS) as client:
-                while True:
-                    selected = pool.select(used) if pool else ((0, keys[0]) if not used else None)
-                    if selected is None:
-                        raise GenerationRateLimitError("OpenRouter keys are rate limited", terminal=True,
-                                                       retry_after=pool.retry_after() if pool else None)
-                    index, key = selected
-                    used.add(index)
-                    headers = {"Authorization": f"Bearer {key}"}
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(ATTEMPT_TIMEOUT_SECONDS):
+                async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT_SECONDS) as client:
                     async with limits.generation_gate.slot():
+                        cooldown = _model_cooldown(self.settings, self.key_index, payload["model"])
+                        if cooldown is not None:
+                            raise cooldown
                         response = await client.post(
                             f"{self.settings.generation_base_url}/chat/completions",
-                            headers=headers, json=payload,
+                            headers=self.headers, json=payload,
                         )
-                    try:
-                        data = response.json()
-                    except ValueError:
-                        data = None
-                    error = data.get("error") if isinstance(data, dict) else None
-                    if pool and _is_openrouter_platform_429(response, error):
-                        pool.mark_pending(index)
-                        cooldown = _retry_after(response.headers.get("retry-after")) or 60.0
-                        try:
-                            cooldown = await _key_cooldown(client, headers, response)
-                        finally:
-                            pool.limit(index, cooldown)
-                        logger.warning("OpenRouter key rate limited: key_slot=%s", index + 1)
-                        continue
-                    if pool and _is_rate_limit_response(response, error):
-                        if len(used) < len(keys):
-                            logger.warning("OpenRouter 429, trying next key: key_slot=%s", index + 1)
-                            continue
-                    return response, data, error
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+            error = data.get("error") if isinstance(data, dict) else None
+            return response, data, error
+        except (httpx.HTTPError, TimeoutError) as exc:
+            details = "".join(traceback.format_exception(exc))
+            for key in configured_generation_keys(self.settings):
+                details = details.replace(key, "<REDACTED>")
+            logger.warning("Generation provider call failed: model=%s key_slot=%s elapsed_ms=%s error_type=%s\n%s",
+                           self.settings.generation_model, self.key_index + 1,
+                           int((time.monotonic() - started) * 1000), type(exc).__name__, details)
+            raise
 
     async def generate(self, system: str, prompt: str,
                        response_format: dict[str, Any] | None = None) -> GenerateResponse:
@@ -228,7 +217,10 @@ class OpenAICompatibleGenerationProvider:
             )
             if openrouter and (self.schema_supported is False or
                                self.schema_supported is None and self.settings.generation_model in _JSON_ONLY_MODELS):
-                output_format = {"type": "json_object"}
+                output_format = {"type": "json_object"} if self.json_supported is not False else None
+        elif self.json_supported is False:
+            system += "\nReturn exactly one valid JSON value."
+            output_format = None
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -239,16 +231,21 @@ class OpenAICompatibleGenerationProvider:
             "messages": messages,
             "max_tokens": 8192,
             "temperature": 0,
-            "response_format": output_format,
             "stream": False,
         }
-        if openrouter and (self.schema_supported is not None or output_format["type"] == "json_schema"):
+        if output_format is not None:
+            payload["response_format"] = output_format
+        if openrouter and output_format is not None and (
+                self.schema_supported is not None or output_format["type"] == "json_schema"):
             payload["provider"] = {**payload.get("provider", {}), "require_parameters": True}
         try:
             # The outer batch deadline also covers queueing, pacing, and slow response bodies.
             response, data, error = await self._post(payload)
             if response.is_error or error is not None:
-                raise _provider_error(response, error)
+                failure = _provider_error(response, error)
+                if isinstance(failure, (GenerationUnavailableError, GenerationRateLimitError)) and not failure.terminal:
+                    _cool_down_model(self.settings, self.key_index, payload["model"], failure)
+                raise failure
             if not response.is_success:
                 raise GenerationInvalidResponseError("Generation provider returned an unexpected status")
             choice = data["choices"][0]
@@ -305,34 +302,6 @@ def _is_rate_limit_response(response: httpx.Response, error: Any) -> bool:
             isinstance(error, dict) and str(error.get("code")) == "429")
 
 
-def _is_openrouter_platform_429(response: httpx.Response, error: Any) -> bool:
-    error = error if isinstance(error, dict) else {}
-    metadata = error.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
-    return (_is_rate_limit_response(response, error)
-            and metadata.get("provider_code") is None
-            and not metadata.get("provider_name")
-            and any(header in response.headers for header in (
-                "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset",
-            )))
-
-
-async def _key_cooldown(client: httpx.AsyncClient, headers: dict[str, str],
-                        response: httpx.Response) -> float:
-    cooldown = _retry_after(response.headers.get("retry-after"))
-    try:
-        status = await client.get("https://openrouter.ai/api/v1/key", headers=headers, timeout=2.0)
-        if status.is_success:
-            remaining = status.json()["data"]["free_model_daily_requests"]["remaining"]
-            if isinstance(remaining, int) and not isinstance(remaining, bool) and remaining == 0:
-                now = datetime.now(timezone.utc)
-                midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                return (midnight - now).total_seconds()
-    except (httpx.HTTPError, KeyError, TypeError, ValueError):
-        pass
-    return cooldown if cooldown is not None else 60.0
-
-
 def _provider_error(response: httpx.Response, error: Any) -> GenerationError:
     error = error if isinstance(error, dict) else {}
     code = 429 if _is_rate_limit_response(response, error) else error.get("code", response.status_code)
@@ -341,7 +310,7 @@ def _provider_error(response: httpx.Response, error: Any) -> GenerationError:
     metadata = error.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
     if code == 429:
-        # Unknown 429s may be shared account quota: only explicit upstream limits can fall through.
+        # A quota can apply only to this model; continue the selected chain on the same key.
         upstream = (metadata.get("provider_code") is not None or bool(metadata.get("provider_name"))
                     or "upstream" in message or "temporarily rate-limited" in message)
         global_limit = not upstream and any(
@@ -350,7 +319,6 @@ def _provider_error(response: httpx.Response, error: Any) -> GenerationError:
         failure = GenerationRateLimitError(
             "Provider rate limit exceeded",
             code="GENERATION_QUOTA_EXCEEDED" if global_limit else "GENERATION_RATE_LIMITED",
-            terminal=not upstream,
         )
     elif code in (401, 402, 403) or (400 <= code < 500 and code not in (404, 408)):
         failure = GenerationInvalidResponseError("Generation provider rejected the request",
@@ -363,7 +331,7 @@ def _provider_error(response: httpx.Response, error: Any) -> GenerationError:
         failure = GenerationUnavailableError("Generation provider is temporarily unavailable")
     else:
         failure = GenerationInvalidResponseError("Provider returned an invalid generation response")
-    if code in (429, 503):
+    if isinstance(failure, (GenerationUnavailableError, GenerationRateLimitError)):
         failure.retry_after = _retry_after(response.headers.get("retry-after"))
     logger.warning("Provider error response: code=%s, classification=%s", code, failure.code)
     return failure
@@ -499,6 +467,8 @@ def generation_catalog(settings: Settings, *,
         "provider": provider.name,
         "allowed_models": models,
         "default_models": defaults,
+        "json_models": sorted(snapshot.json_models) if dynamic else [],
+        "schema_models": sorted(snapshot.schema_models) if dynamic else [],
         "catalog_fingerprint": fingerprint,
         "limits": {"system_chars": 8000, "prompt_chars": 48000, "chain_length": 3},
     }
@@ -561,13 +531,22 @@ async def generate_text(
     )
     if model_index >= len(models):
         raise GenerationRequestError("model_index is outside the configured generation chain")
+    key_count = len(configured_generation_keys(settings)) if provider.name == "remote" else 1
     try:
         async with asyncio.timeout_at(deadline):
-            for index in range(model_index, len(models)):
+            for key_index, index in product(range(key_count), range(model_index, len(models))):
+                if key_index and index == model_index:
+                    logger.warning("Generation key retry: key_slot=%s", key_index + 1)
                 if provider.name == "remote":
+                    cooldown = _model_cooldown(settings, key_index, models[index])
+                    if cooldown is not None:
+                        failure = cooldown
+                        continue
                     provider = OpenAICompatibleGenerationProvider(
                         settings.model_copy(update={"generation_model": models[index]}),
                         schema_supported=(models[index] in snapshot.schema_models if snapshot else None),
+                        json_supported=(models[index] in snapshot.json_models if snapshot else None),
+                        key_index=key_index,
                     )
                 first_attempt = attempt if index == model_index else 1
                 for current_attempt in range(first_attempt, 3):
@@ -602,14 +581,21 @@ async def generate_text(
                             raise
                         failure = exc
                     except (GenerationUnavailableError, GenerationRateLimitError, OllamaUnavailableError) as exc:
+                        logger.warning("Generation attempt failed: key_slot=%s model_index=%s attempt=%s code=%s",
+                                       key_index + 1, index, current_attempt, getattr(exc, "code", "GENERATION_UNAVAILABLE"))
                         if isinstance(exc, GenerationError) and exc.terminal:
                             raise
                         failure = exc
-                        if isinstance(exc, GenerationError) and exc.retry_after and index + 1 < len(models):
-                            await asyncio.sleep(exc.retry_after)
                         break
                     logger.warning("Generation attempt failed: model_index=%s attempt=%s code=%s",
                                    index, current_attempt, getattr(failure, "code", "INVALID_GENERATION_RESPONSE"))
+            if provider.name == "remote":
+                cooldowns = [_model_cooldown(settings, key, models[index])
+                             for key, index in product(range(key_count), range(model_index, len(models)))]
+                if all(cooldown is not None for cooldown in cooldowns):
+                    failure = min(cooldowns, key=lambda cooldown: cooldown.retry_after)
+                elif isinstance(failure, GenerationError):
+                    failure.retry_after = None
             raise failure
     except TimeoutError as exc:
         raise GenerationUnavailableError("Generation batch deadline exceeded",

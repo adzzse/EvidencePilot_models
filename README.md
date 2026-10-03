@@ -64,10 +64,20 @@ not placed in the default chain when stable variants exist. For a non-OpenRouter
 For optional OpenRouter key failover, leave `GENERATION_API_KEY` empty and set
 `GENERATION_API_KEYS` to a JSON array of one to three distinct keys in local
 secret configuration. The two settings cannot be used together. The service
-keeps using the active key until an identifiable OpenRouter platform 429, then
-tries the same model request with the next available key inside the existing
-deadline. Upstream 429s still follow model fallback; unknown 429s stop. Key
-state is process-local. [OpenRouter says](https://openrouter.ai/docs/api_reference/limits)
+tries every selected model on the first key before repeating the model chain
+on the next key. A timeout, transport error, or 429 skips to the next model on
+the same key, including daily free-model quota errors. Remote models enter a
+process-local cooldown only when a retryable provider error includes a valid,
+positive `Retry-After` (seconds or HTTP date). Timeout, transport errors, and
+responses without that header do not create a cooldown. Each timer belongs to
+the provider endpoint, API key identity, and exact outbound model name; another
+key may still try the same model, and other models on the same key remain eligible.
+Timers survive between requests and key/model reordering, but not service restarts.
+A cooling pair is skipped before queueing and checked again before sending;
+after expiry it can be tried again. No task sleeps while waiting for a timer.
+Each call has a 60-second timeout within the remaining batch budget.
+Terminal errors and exhausted batch budgets stop the chain. Each new request
+starts with the first configured key. [OpenRouter says](https://openrouter.ai/docs/api_reference/limits)
 extra accounts or keys do not guarantee more capacity, and switching keys can
 reduce [response-cache hits](https://openrouter.ai/docs/guides/features/response-caching).
 
@@ -79,16 +89,22 @@ or other managed request parameters in `GENERATION_EXTRA_BODY`.
 
 Each call uses one model, `temperature=0`, `max_tokens=8192`, and non-streaming
 JSON output. Catalog models advertising `structured_outputs` receive native
-JSON Schema mode when requested; other eligible models receive JSON object mode
-plus the requested schema in the system instruction. Python validates complete output, JSON and the supplied schema before
+JSON Schema mode when requested; models supporting only `response_format` receive
+JSON object mode, and models supporting neither receive formatting instructions
+without a native response format. The requested schema remains in the system
+instruction. Python validates complete output, JSON and the supplied schema before
 returning success. Invalid output gets one regeneration on the same model, then
 the next model; transport failures go directly to the next model. Refusals,
-request/authentication errors, and shared or ambiguous quota limits stop the call.
-Explicit upstream rate limits can fall through. `Retry-After` on upstream 429
-and temporary 503 responses is honored within the batch budget.
+request/authentication errors stop the call. Model/key pairs on cooldown are skipped
+without waiting for their `Retry-After`, including temporary 503 responses.
+If every remaining model/key pair is on cooldown, the service returns the failure
+for the pair that becomes available first, with its remaining `Retry-After`,
+without making another provider request. If any remaining pair has no active
+timer, the final error does not advertise a chain-wide `Retry-After` delay.
 
 The batch budget is at most 300 seconds including queueing, pacing and all
-attempts (at most two per model, six total); each remote HTTP attempt is capped
+attempts (at most two per key/model pair, 18 total with three keys and three models);
+each remote HTTP attempt is capped
 at 60 seconds. Paper PDF heading repair has a separate 30-second budget and keeps
 the MinerU result on failure.
 Embeddings and document extraction always remain local. Generation context,
@@ -112,7 +128,7 @@ Paper heading repair. Local calls have no remote pacing delay.
 
 Before activating the full chain for Java traffic, update Java to consume the
 continuation fields below and remove its duplicate generation retries. The
-300-second/six-attempt bound applies to one Python request until Java shares the
+300-second/18-attempt bound applies to one Python request until Java shares the
 same deadline across semantic validation attempts. Existing `.env` files are not
 changed automatically by a code update.
 
@@ -123,6 +139,12 @@ cd E:\Code\SEP490\EvidencePilot_models
 .\.venv\Scripts\Activate.ps1
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+Python logs and Uvicorn access/error logs are also saved to `logs/model-service.log`,
+including timestamps and generation tracebacks. The file rotates at 10 MiB and
+retains five backups. Configured API keys and URL query strings are redacted in
+the file; request prompts and model responses are not added to logs. This applies
+to both direct Uvicorn runs and `scripts/start_ngrok_tunnel.py`; `logs/` is Git-ignored.
 
 `GET /health` is public. Every `POST` route requires `X-API-Key`.
 Remote health checks catalog coverage for the configured or discovered models; it does not prove

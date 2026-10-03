@@ -48,6 +48,7 @@ HEADERS = {"X-API-Key": "test-key"}
 def settings_override(monkeypatch):
     monkeypatch.setattr(limits, "local_gate", limits.ModelCallGate(4))
     monkeypatch.setattr(limits, "generation_gate", limits.ModelCallGate(4))
+    monkeypatch.setattr(generation, "_model_cooldowns", {})
     main.app.dependency_overrides[main.get_settings] = lambda: SETTINGS
     try:
         yield
@@ -58,6 +59,44 @@ def settings_override(monkeypatch):
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(main.app)
+
+
+@pytest.mark.parametrize("status, code", [(429, "GENERATION_RATE_LIMITED"), (503, "GENERATION_UNAVAILABLE")])
+def test_generation_api_returns_earliest_pair_retry_after(client, monkeypatch, status, code):
+    settings = SETTINGS.model_copy(update={
+        "generation_provider": "remote", "generation_base_url": "https://openrouter.ai/api/v1",
+        "generation_api_keys": ("key-a", "key-b", "key-c"), "generation_model": "provider/model:free",
+    })
+    main.app.dependency_overrides[main.get_settings] = lambda: settings
+    now = [100.0]
+    monkeypatch.setattr(generation, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    requests = []
+    responses = iter([
+        *[httpx.Response(status, headers={"Retry-After": str(delay)}) for delay in (5, 20, 60)],
+        httpx.Response(200, json={"model": settings.generation_model, "choices": [
+            {"finish_reason": "stop", "message": {"content": '{"ok":true}'}}]}),
+    ])
+    real_client = httpx.AsyncClient
+
+    async def respond(request):
+        requests.append(request)
+        return next(responses)
+
+    monkeypatch.setattr(generation.httpx, "AsyncClient",
+                        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs))
+    for elapsed in (0, 2):
+        now[0] = 100.0 + elapsed
+        response = client.post("/ai/generate", headers=HEADERS, json={"prompt": "Review"})
+        assert response.status_code == status and response.json()["code"] == code
+        assert response.headers["Retry-After"] == str(5 - elapsed)
+        assert all(key not in response.text for key in settings.generation_api_keys)
+    assert len(requests) == 3
+    now[0] = 105.0
+    response = client.post("/ai/generate", headers=HEADERS, json={"prompt": "Review"})
+    assert response.status_code == 200 and response.json()["done"] is True
+    assert [request.headers["Authorization"] for request in requests] == [
+        "Bearer key-a", "Bearer key-b", "Bearer key-c", "Bearer key-a",
+    ]
 
 
 def test_model_call_gate_caps_concurrency_and_spaces_starts():
@@ -167,7 +206,7 @@ def test_generation_config_exposes_dynamic_openrouter_choices(client, monkeypatc
     from app.openrouter_catalog import CatalogSnapshot
 
     models = tuple(f"provider/model-{index}:free" for index in range(5))
-    snapshot = CatalogSnapshot(models, frozenset(models), models[:3])
+    snapshot = CatalogSnapshot(models, frozenset(models[:2]), models[:3], frozenset(models[:4]))
     monkeypatch.setattr(generation.openrouter_catalog, "get_catalog", lambda *_: snapshot)
     settings = SETTINGS.model_copy(update={
         "generation_provider": "remote", "generation_api_key": "provider-secret",
@@ -181,6 +220,8 @@ def test_generation_config_exposes_dynamic_openrouter_choices(client, monkeypatc
     assert response.status_code == 200
     assert response.json()["allowed_models"] == list(models)
     assert response.json()["default_models"] == list(models[:3])
+    assert response.json()["json_models"] == list(models[:4])
+    assert response.json()["schema_models"] == list(models[:2])
     assert "provider-secret" not in response.text
 
 
@@ -374,7 +415,7 @@ def test_generate_passes_json_schema_response_format(client: TestClient, monkeyp
         (GenerationInvalidResponseError("malformed"), 502),
     ],
 )
-def test_generation_errors_map_to_gateway_status(failure, expected_status, monkeypatch):
+def test_generation_errors_map_to_gateway_status(failure, expected_status, monkeypatch, caplog):
     async def generate(*_, **_options):
         raise failure
 
@@ -388,6 +429,9 @@ def test_generation_errors_map_to_gateway_status(failure, expected_status, monke
 
     assert response.status_code == expected_status
     assert response.json() == {"detail": str(failure), "code": failure.code}
+    assert f"status={expected_status}" in caplog.text and f"code={failure.code}" in caplog.text
+    assert f"error_type={type(failure).__name__}" in caplog.text and "action=return_error" in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 def test_single_and_batch_embeddings_preserve_order(client: TestClient, monkeypatch):

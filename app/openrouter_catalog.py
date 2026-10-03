@@ -27,6 +27,7 @@ class CatalogSnapshot:
     allowed_models: tuple[str, ...]
     schema_models: frozenset[str]
     default_models: tuple[str, ...]
+    json_models: frozenset[str] = frozenset()
 
 
 def _zero(value) -> bool:
@@ -34,6 +35,16 @@ def _zero(value) -> bool:
         return Decimal(str(value)) == 0
     except (InvalidOperation, TypeError, ValueError):
         return False
+
+
+def _free(model: object) -> bool:
+    if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+        return False
+    model_id = model["id"]
+    pricing = model.get("pricing")
+    return (bool(model_id) and model_id.strip() == model_id and len(model_id) <= 255
+            and isinstance(pricing, dict) and _zero(pricing.get("prompt"))
+            and _zero(pricing.get("completion")) and _zero(pricing.get("request") or 0))
 
 
 def _eligible(model: object) -> tuple[str, bool, int, int] | None:
@@ -75,25 +86,37 @@ def _fetch(base_url: str, keys: tuple[str, ...]) -> CatalogSnapshot:
                 models = response.json()["data"]
                 if not isinstance(models, list):
                     raise ValueError("invalid catalog")
-                eligible = [item for model in models if (item := _eligible(model))]
-                catalogs.append({item[0]: item[1:] for item in eligible})
+                catalogs.append({model["id"]: model for model in models if _free(model)})
     except CatalogAuthenticationError:
         raise
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
         raise CatalogUnavailableError("OpenRouter model catalog is unavailable") from None
     common = set.intersection(*(set(catalog) for catalog in catalogs))
     if not common:
-        raise CatalogNoModelsError("No compatible free OpenRouter models are available")
-    schema = frozenset(model_id for model_id in common
-                       if all(catalog[model_id][0] for catalog in catalogs))
-    ranked = sorted(common, key=lambda model_id: (
-        -min(catalog[model_id][1] for catalog in catalogs),
+        raise CatalogNoModelsError("No free OpenRouter models are available")
+    json_models = frozenset(model_id for model_id in common if all(
+        "response_format" in (catalog[model_id].get("supported_parameters") or [])
+        for catalog in catalogs
+    ))
+    schema = frozenset(model_id for model_id in json_models if all(
+        "structured_outputs" in (catalog[model_id].get("supported_parameters") or [])
+        for catalog in catalogs
+    ))
+    eligible = {}
+    for model_id in common:
+        details = tuple(_eligible(catalog[model_id]) for catalog in catalogs)
+        if all(details):
+            eligible[model_id] = details
+    ranked = sorted(eligible, key=lambda model_id: (
+        -min(item[2] for item in eligible[model_id]),
         model_id not in schema,
-        -min(catalog[model_id][2] for catalog in catalogs),
+        -min(item[3] for item in eligible[model_id]),
         model_id,
     ))
     defaults = [model_id for model_id in ranked if "preview" not in model_id.casefold()]
-    return CatalogSnapshot(tuple(sorted(common)), schema, tuple((defaults or ranked)[:3]))
+    fallback = sorted(json_models) or sorted(common)
+    return CatalogSnapshot(tuple(sorted(common)), schema, tuple((defaults or ranked or fallback)[:3]),
+                           json_models)
 
 
 class _CatalogCache:

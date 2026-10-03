@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import math
 import os
 import secrets
@@ -10,6 +9,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
+from app.logging_config import configure_logging
 from app.extraction import (
     ExtractionError,
     ExtractionUnavailableError,
@@ -45,7 +45,7 @@ from app.ollama_client import (
 from app.settings import Settings, load_settings
 
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 
 
 app = FastAPI(title="EvidencePilot AI Worker", version="1.0.0")
