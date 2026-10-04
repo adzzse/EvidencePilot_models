@@ -141,9 +141,12 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 Python logs and Uvicorn access/error logs are also saved to `logs/model-service.log`,
-including timestamps and generation tracebacks. The file rotates at 10 MiB and
-retains five backups. Configured API keys and URL query strings are redacted in
-the file; request prompts and model responses are not added to logs. This applies
+including timestamps and concise error summaries. Errors show their type and
+generation failures identify the reason, model, key slot, elapsed time and next
+action; handled HTTP errors include the response status and error code. Console
+and file output use the same redacted format without stack traces. The file rotates
+at 10 MiB and retains five backups. Configured API keys and URL query strings are
+redacted in both outputs; request prompts and model responses are not added to logs. This applies
 to both direct Uvicorn runs and `scripts/start_ngrok_tunnel.py`; `logs/` is Git-ignored.
 
 `GET /health` is public. Every `POST` route requires `X-API-Key`.

@@ -5,7 +5,6 @@ import logging
 import math
 import re
 import time
-import traceback
 from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -181,6 +180,7 @@ class OpenAICompatibleGenerationProvider:
 
     async def _post(self, payload: dict[str, Any]) -> tuple[httpx.Response, Any, Any]:
         started = time.monotonic()
+        sent = False
         try:
             async with asyncio.timeout(ATTEMPT_TIMEOUT_SECONDS):
                 async with httpx.AsyncClient(timeout=ATTEMPT_TIMEOUT_SECONDS) as client:
@@ -188,6 +188,7 @@ class OpenAICompatibleGenerationProvider:
                         cooldown = _model_cooldown(self.settings, self.key_index, payload["model"])
                         if cooldown is not None:
                             raise cooldown
+                        sent = True
                         response = await client.post(
                             f"{self.settings.generation_base_url}/chat/completions",
                             headers=self.headers, json=payload,
@@ -199,12 +200,13 @@ class OpenAICompatibleGenerationProvider:
             error = data.get("error") if isinstance(data, dict) else None
             return response, data, error
         except (httpx.HTTPError, TimeoutError) as exc:
-            details = "".join(traceback.format_exception(exc))
-            for key in configured_generation_keys(self.settings):
-                details = details.replace(key, "<REDACTED>")
-            logger.warning("Generation provider call failed: model=%s key_slot=%s elapsed_ms=%s error_type=%s\n%s",
-                           self.settings.generation_model, self.key_index + 1,
-                           int((time.monotonic() - started) * 1000), type(exc).__name__, details)
+            if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+                reason = "provider_timeout" if sent else "queue_timeout"
+            else:
+                reason = "connection_error" if isinstance(exc, httpx.ConnectError) else "transport_error"
+            logger.warning("Generation provider call failed: reason=%s model=%s key_slot=%s elapsed_ms=%s error_type=%s",
+                           reason, payload["model"], self.key_index + 1,
+                           int((time.monotonic() - started) * 1000), type(exc).__name__)
             raise
 
     async def generate(self, system: str, prompt: str,
@@ -549,6 +551,8 @@ async def generate_text(
                         key_index=key_index,
                     )
                 first_attempt = attempt if index == model_index else 1
+                next_action = ("try_next_model" if index + 1 < len(models)
+                               else "try_next_key" if key_index + 1 < key_count else "return_error")
                 for current_attempt in range(first_attempt, 3):
                     instruction = request.system
                     if current_attempt == 2:
@@ -576,19 +580,22 @@ async def generate_text(
                                                         "attempt": current_attempt,
                                                         "next_model_index": index + 1 if index + 1 < len(models) else None,
                                                         "catalog_fingerprint": selection_fingerprint})
-                    except (GenerationInvalidResponseError, OllamaInvalidResponseError) as exc:
-                        if isinstance(exc, GenerationError) and exc.terminal:
+                    except (GenerationInvalidResponseError, OllamaInvalidResponseError,
+                            GenerationUnavailableError, GenerationRateLimitError, OllamaUnavailableError) as exc:
+                        terminal = isinstance(exc, GenerationError) and exc.terminal
+                        repairable = isinstance(exc, (GenerationInvalidResponseError, OllamaInvalidResponseError))
+                        action = ("return_error" if terminal else "regenerate" if repairable and current_attempt == 1
+                                  else next_action)
+                        logger.warning("Generation attempt failed: model=%s key_slot=%s model_index=%s attempt=%s "
+                                       "code=%s error_type=%s action=%s",
+                                       models[index], key_index + 1, index, current_attempt,
+                                       getattr(exc, "code", "INVALID_GENERATION_RESPONSE" if repairable
+                                               else "GENERATION_UNAVAILABLE"), type(exc).__name__, action)
+                        if terminal:
                             raise
                         failure = exc
-                    except (GenerationUnavailableError, GenerationRateLimitError, OllamaUnavailableError) as exc:
-                        logger.warning("Generation attempt failed: key_slot=%s model_index=%s attempt=%s code=%s",
-                                       key_index + 1, index, current_attempt, getattr(exc, "code", "GENERATION_UNAVAILABLE"))
-                        if isinstance(exc, GenerationError) and exc.terminal:
-                            raise
-                        failure = exc
-                        break
-                    logger.warning("Generation attempt failed: model_index=%s attempt=%s code=%s",
-                                   index, current_attempt, getattr(failure, "code", "INVALID_GENERATION_RESPONSE"))
+                        if not repairable:
+                            break
             if provider.name == "remote":
                 cooldowns = [_model_cooldown(settings, key, models[index])
                              for key, index in product(range(key_count), range(model_index, len(models)))]

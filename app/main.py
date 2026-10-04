@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import os
 import secrets
@@ -46,6 +47,7 @@ from app.settings import Settings, load_settings
 
 
 configure_logging()
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(title="EvidencePilot AI Worker", version="1.0.0")
@@ -209,6 +211,8 @@ async def invalid_upstream_handler(_, exc: RuntimeError):
 
 
 def _error_response(status_code: int, exc: Exception) -> JSONResponse:
+    logger.warning("Request failed: status=%s code=%s error_type=%s detail=%s action=return_error",
+                   status_code, getattr(exc, "code", type(exc).__name__), type(exc).__name__, exc)
     content = {"detail": str(exc)}
     headers = {}
     if isinstance(exc, GenerationError):
